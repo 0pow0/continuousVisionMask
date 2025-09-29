@@ -9,6 +9,7 @@ Features
 - Straight-through index head (optional Gumbel-Softmax) for code selection
 - Frozen pretrained actor consumes quantized latents; training matches its distribution to demonstrations
 - Commitment loss keeps encoder latents aligned with chosen codes
+- Optional Weights & Biases logging for metrics
 - Gradient clipping, cosine LR schedule, EMA of model weights (optional)
 - Checkpointing, resuming, and sample reconstruction grids
 - Clean configuration via argparse
@@ -37,7 +38,9 @@ from __future__ import annotations
 import math
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -358,6 +361,9 @@ class Config:
     st_tau: float = 1.0
     actor_ckpt: str | None = None
     action_dim: int | None = None
+    use_wandb: bool = False
+    wandb_project: str = ""
+    wandb_run_name: str | None = None
 
     num_workers: int = 8
     grad_clip: float = 1.0
@@ -510,11 +516,9 @@ class GaussianMSEKLLoss(nn.Module):
         pred_std = F.softplus(pred_std) + self.min_std
         target_std = target_std.clamp_min(self.min_std)
 
-        # --- MSE 部分 ---
         mse_mean = F.mse_loss(pred_mean, target_mean)
         mse_std = F.mse_loss(pred_std, target_std)
 
-        # --- KL 部分 ---
         if self.direction == "target||pred":
             kl = (
                 torch.log(pred_std / target_std)
@@ -529,14 +533,17 @@ class GaussianMSEKLLoss(nn.Module):
             )
         else:
             raise ValueError("direction must be 'target||pred' or 'pred||target'")
-        # kl = kl.mean()
 
-        # --- 动态 KL 权重 ---
+        kl_mean = kl.mean()
         gamma = self._get_gamma()
-
-        # --- 总损失 ---
-        loss = self.alpha * mse_mean + self.beta * mse_std + gamma * kl
-        return loss, {"mse_mean": mse_mean.item(), "mse_std": mse_std.item(), "kl": kl.mean().item(), "gamma": gamma}
+        loss = self.alpha * mse_mean + self.beta * mse_std + gamma * kl_mean
+        metrics = {
+            "mse_mean": float(mse_mean.item()),
+            "mse_std": float(mse_std.item()),
+            "kl": float(kl_mean.item()),
+            "gamma": float(gamma),
+        }
+        return loss, metrics
 
 
 def train(cfg: Config):
@@ -576,6 +583,24 @@ def train(cfg: Config):
     opt = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
+    wandb_run = None
+    if cfg.use_wandb:
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            print("wandb is not installed; disabling logging.")
+        else:
+            init_kwargs: dict[str, object] = {
+                "project": cfg.wandb_project or "continuousVisionMask",
+                "config": asdict(cfg),
+            }
+            if cfg.wandb_run_name:
+                init_kwargs["name"] = cfg.wandb_run_name
+            else:
+                data_stem = Path(cfg.data_path).stem
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                init_kwargs["name"] = f"{data_stem}-{timestamp}"
+            wandb_run = wandb.init(**init_kwargs)
     start_epoch = 0
     global_step = 0
     if cfg.resume:
@@ -589,102 +614,87 @@ def train(cfg: Config):
 
     kl_loss = GaussianMSEKLLoss(alpha=1.0, beta=1.0, min_std=1e-6)
 
-    for epoch in range(start_epoch, cfg.epochs):
-        model.train()
-        running_nll, running_commit, running_ppl = 0.0, 0.0, 0.0
-        progress = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch+1}/{cfg.epochs}",
-            leave=False,
-        )
-        for i, batch in enumerate(progress):
-            vecs = batch[0].to(device, non_blocking=True)
-            target_mean = batch[1].to(device, non_blocking=True)
-            target_std = batch[2].to(device, non_blocking=True)
-
-            (
-                dist,
-                commit_loss,
-                perplexity,
-                usage,
-                predicted_indices,
-                index_logits,
-                index_assignments,
-            ) = model(vecs)
-            pred_mean = dist.mean
-            pred_std = dist.stddev
-
-            # kl = kl_divergence_gaussian(
-                # pred_mean=pred_mean,
-                # pred_std=pred_std,
-                # target_mean=target_mean,
-                # target_std=target_std,
-                # min_std=1e-6,
-                # direction="pred||target",
-            # )
-
-            kl, kl_info = kl_loss(
-                pred_mean=pred_mean,
-                pred_std=pred_std,
-                target_mean=target_mean,
-                target_std=target_std,
+    try:
+        for epoch in range(start_epoch, cfg.epochs):
+            model.train()
+            kl_loss.set_epoch(epoch)
+            running_nll, running_commit, running_ppl = 0.0, 0.0, 0.0
+            progress = tqdm(
+                train_loader,
+                desc=f"Epoch {epoch+1}/{cfg.epochs}",
+                leave=False,
             )
+            for i, batch in enumerate(progress):
+                vecs = batch[0].to(device, non_blocking=True)
+                target_mean = batch[1].to(device, non_blocking=True)
+                target_std = batch[2].to(device, non_blocking=True)
 
+                (
+                    dist,
+                    commit_loss,
+                    perplexity,
+                    usage,
+                    predicted_indices,
+                    index_logits,
+                    index_assignments,
+                ) = model(vecs)
+                pred_mean = dist.mean
+                pred_std = dist.stddev
 
-            # kl = (
-            #     torch.log(pred_std / target_std_clamped)
-            #     + (target_std_clamped.pow(2) + (target_mean - pred_mean).pow(2))
-            #     / (2 * pred_std.pow(2))
-            #     - 0.5
-            # )
-            # 看每维的 KL 规模
-            # kl 的 shape 应该是 (32, 2)
-            # print("KL per-dim mean:", kl.mean(dim=0))  # (2,)
-            # print("KL per-dim max :", kl.max(dim=0).values)
+                kl_value, kl_info = kl_loss(
+                    pred_mean=pred_mean,
+                    pred_std=pred_std,
+                    target_mean=target_mean,
+                    target_std=target_std,
+                )
 
-            # 看 std 的范围（是否过小）
-            # print("pred_std[min,max]:", pred_std.min().item(), pred_std.max().item())
-            # print(
-            # "tgt_std [min,max]:", target_std.min().item(), target_std.max().item()
-            # )
+                nll = kl_value
+                loss = nll + cfg.beta * commit_loss
 
-            # 看均值差的规模
-            # mean_err = (target_mean - pred_mean).abs()
-            # print(
-            # "mean|Δμ| avg:", mean_err.mean().item(), "max:", mean_err.max().item()
-            # )
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if cfg.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                opt.step()
 
-            nll = kl.sum(dim=-1).mean()
-            loss = nll + cfg.beta * commit_loss
+                if ema is not None:
+                    ema.update(model)
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            opt.step()
+                # LR schedule
+                lr = cosine_warmup_lr(opt, cfg.lr, warmup_steps, total_steps, global_step)
 
-            if ema is not None:
-                ema.update(model)
+                running_nll += nll.item()
+                running_commit += commit_loss.item()
+                running_ppl += float(perplexity)
 
-            # LR schedule
-            lr = cosine_warmup_lr(opt, cfg.lr, warmup_steps, total_steps, global_step)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "train/nll": float(nll.item()),
+                            "train/commit": float(commit_loss.item()),
+                            "train/perplexity": float(perplexity),
+                            "train/usage": float(usage),
+                            "train/lr": lr,
+                            "train/mse_mean": kl_info.get("mse_mean", 0.0),
+                            "train/mse_std": kl_info.get("mse_std", 0.0),
+                            "train/kl": kl_info.get("kl", 0.0),
+                            "train/gamma": kl_info.get("gamma", 0.0),
+                        },
+                        step=global_step,
+                    )
 
-            running_nll += nll.item()
-            running_commit += commit_loss.item()
-            running_ppl += float(perplexity)
+                avg_nll = running_nll / (i + 1)
+                avg_commit = running_commit / (i + 1)
+                avg_ppl = running_ppl / (i + 1)
+                progress.set_postfix(
+                    lr=f"{lr:.3e}",
+                    nll=f"{avg_nll:.6f}",
+                    commit=f"{avg_commit:.6f}",
+                    ppl=f"{avg_ppl:.2f}",
+                    usage=f"{usage.item():.2f}",
+                )
 
-            avg_nll = running_nll / (i + 1)
-            avg_commit = running_commit / (i + 1)
-            avg_ppl = running_ppl / (i + 1)
-            progress.set_postfix(
-                lr=f"{lr:.3e}",
-                nll=f"{avg_nll:.6f}",
-                commit=f"{avg_commit:.6f}",
-                ppl=f"{avg_ppl:.2f}",
-                usage=f"{usage.item():.2f}",
-            )
-
-            global_step += 1
+                global_step += 1
         progress.close()
 
         # Validation / Sampling
@@ -695,6 +705,62 @@ def train(cfg: Config):
                 shadow = ModelEMA(model, cfg.ema_decay)
                 shadow.shadow = {k: v.clone() for k, v in ema.shadow.items()}
                 shadow.copy_to(model)
+
+            val_metrics = {}
+            if val_loader is not None:
+                total_nll = 0.0
+                total_commit = 0.0
+                total_ppl = 0.0
+                total_usage = 0.0
+                total_examples = 0
+                total_batches = 0
+                total_mse_mean = 0.0
+                total_mse_std = 0.0
+                total_kl = 0.0
+                for v_batch in val_loader:
+                    vecs_v = v_batch[0].to(device, non_blocking=True)
+                    mean_v = v_batch[1].to(device, non_blocking=True)
+                    std_v = v_batch[2].to(device, non_blocking=True)
+                    (
+                        dist_v,
+                        commit_loss_v,
+                        perplexity_v,
+                        usage_v,
+                        _,
+                        _,
+                        _,
+                    ) = model(vecs_v)
+                    pred_mean_v = dist_v.mean
+                    pred_std_v = dist_v.stddev
+                    kl_val, kl_info_val = kl_loss(
+                        pred_mean=pred_mean_v,
+                        pred_std=pred_std_v,
+                        target_mean=mean_v,
+                        target_std=std_v,
+                    )
+                    bs = vecs_v.size(0)
+                    total_nll += kl_val.item() * bs
+                    total_commit += commit_loss_v.item() * bs
+                    total_ppl += float(perplexity_v) * bs
+                    total_usage += float(usage_v) * bs
+                    total_examples += bs
+                    total_batches += 1
+                    total_mse_mean += kl_info_val["mse_mean"] * bs
+                    total_mse_std += kl_info_val["mse_std"] * bs
+                    total_kl += kl_info_val["kl"] * bs
+                if total_examples > 0:
+                    val_metrics = {
+                        "val/nll": total_nll / total_examples,
+                        "val/commit": total_commit / total_examples,
+                        "val/perplexity": total_ppl / total_examples,
+                        "val/usage": total_usage / total_examples,
+                    }
+                    if total_examples > 0:
+                        val_metrics["val/mse_mean"] = total_mse_mean / total_examples
+                        val_metrics["val/mse_std"] = total_mse_std / total_examples
+                        val_metrics["val/kl"] = total_kl / total_examples
+                    if wandb_run is not None:
+                        wandb_run.log(val_metrics, step=global_step)
 
             # Take a small batch for qualitative numeric inspection
             batch_full = next(
@@ -750,6 +816,9 @@ def train(cfg: Config):
             global_step,
             cfg,
         )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 # ---------------------------
@@ -788,15 +857,32 @@ if __name__ == "__main__":
         "--gumbel-tau",
         type=float,
         default=1.0,
-        help="temperature for Gumbel-Softmax when --use-gumbel is enabled",
+        help="temperature to use for Gumbel-Softmax sampling",
     )
     p.add_argument(
         "--st-tau",
         type=float,
         default=1.0,
-        help="temperature for straight-through softmax when not using Gumbel",
+        help="unused placeholder for compatibility",
     )
     p.add_argument("--decay", type=float, default=0.99, help="EMA decay for codebook")
+    p.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging",
+    )
+    p.add_argument(
+        "--wandb-project",
+        type=str,
+        default="",
+        help="Weights & Biases project name",
+    )
+    p.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases run name",
+    )
 
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -836,6 +922,9 @@ if __name__ == "__main__":
         sample_dir=args.sample_dir,
         resume=args.resume,
         seed=args.seed,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
 
     os.makedirs(cfg.out_dir, exist_ok=True)
