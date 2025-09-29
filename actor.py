@@ -3,6 +3,7 @@ import numpy as np
 import torch.nn as nn
 from torch.distributions import Normal
 
+
 def build_mlp_network(sizes):
     """
     Build a multi-layer perceptron (MLP) neural network.
@@ -22,6 +23,7 @@ def build_mlp_network(sizes):
         nn.init.kaiming_uniform_(affine_layer.weight, a=np.sqrt(5))
         layers += [affine_layer, act()]
     return nn.Sequential(*layers)
+
 
 class Actor(nn.Module):
     """
@@ -47,7 +49,7 @@ class Actor(nn.Module):
 
     def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: list = [64, 64]):
         super().__init__()
-        self.mean = build_mlp_network([obs_dim]+hidden_sizes+[act_dim])
+        self.mean = build_mlp_network([obs_dim] + hidden_sizes + [act_dim])
         self.log_std = nn.Parameter(torch.zeros(act_dim), requires_grad=True)
 
     def forward(self, obs: torch.Tensor):
@@ -55,13 +57,22 @@ class Actor(nn.Module):
         std = torch.exp(self.log_std)
         return Normal(mean, std)
 
+
 def main():
-    ckpt = "/home/rzuo02/work/Safe-Policy-Optimization/runs/single_agent_exp/SafetyPointGoal1-v0/ppo/seed-000-2025-09-26-16-59-37/torch_save/model499.pt"
-    print(f"Loading checkpoint: {ckpt}")
-    checkpoint = torch.load(ckpt, map_location="cpu")
-    actor = Actor(obs_dim=60, act_dim=2)
-    actor.load_state_dict(checkpoint)
-    print(actor)
+    # ckpt = "/home/rzuo02/work/Safe-Policy-Optimization/runs/single_agent_exp/SafetyPointGoal1-v0/ppo/seed-000-2025-09-26-16-59-37/torch_save/model499.pt"
+    # print(f"Loading checkpoint: {ckpt}")
+    # checkpoint = torch.load(ckpt, map_location="cpu")
+    # actor = Actor(obs_dim=60, act_dim=2)
+    # actor.load_state_dict(checkpoint)
+    # print(actor)
+    obs_dim = 10
+    act_dim = 2
+    actor = Actor(obs_dim, act_dim)
+    observation = torch.randn(1, obs_dim)
+    action_distribution = actor(observation)
+    print(action_distribution)
+    print(action_distribution.sample())
+    print(action_distribution.rsample())
 
 
 if __name__ == "__main__":

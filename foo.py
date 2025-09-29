@@ -24,6 +24,22 @@ def describe(key, obj, indent=0, max_depth=None):
         print(f"{pad}{key}: {type(obj)}")
 
 
+def summarize_tensor(name: str, tensor: torch.Tensor):
+    if tensor.ndim != 2:
+        print(f"{name}: expected 2D tensor, got shape {tuple(tensor.shape)}")
+        return
+    mins = tensor.amin(dim=0)
+    maxs = tensor.amax(dim=0)
+    means = tensor.mean(dim=0)
+    stds = tensor.std(dim=0, unbiased=False)
+    print(f"{name}: shape={tuple(tensor.shape)}")
+    for idx, (mn, mx, mu, sd) in enumerate(zip(mins, maxs, means, stds)):
+        print(
+            f"  dim {idx:>3}: min={mn.item(): .6f} max={mx.item(): .6f} "
+            f"mean={mu.item(): .6f} std={sd.item(): .6f}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Inspect a PyTorch checkpoint (.pt/.pth)."
@@ -49,7 +65,11 @@ def main():
             describe(key, value, indent=0, max_depth=args.depth)
     else:
         print(checkpoint)
-    print(f"{checkpoint['obs'][1000]=}")
+    for key in ("obs", "act", "act_mean", "act_std"):
+        if key in checkpoint:
+            summarize_tensor(key, checkpoint[key])
+        else:
+            print(f"{key}: not found in checkpoint")
 
 
 if __name__ == "__main__":
