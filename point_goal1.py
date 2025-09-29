@@ -597,9 +597,9 @@ def train(cfg: Config):
             if cfg.wandb_run_name:
                 init_kwargs["name"] = cfg.wandb_run_name
             else:
-                data_stem = Path(cfg.data_path).stem
+                script_stem = Path(__file__).stem
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                init_kwargs["name"] = f"{data_stem}-{timestamp}"
+                init_kwargs["name"] = f"{script_stem}-{timestamp}"
             wandb_run = wandb.init(**init_kwargs)
     start_epoch = 0
     global_step = 0
