@@ -185,6 +185,70 @@ class VectorQuantizerEMA(nn.Module):
         )
 
 
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.query_norm = nn.LayerNorm(dim)
+        self.key_norm = nn.LayerNorm(dim)
+        self.value_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout
+        )
+        hidden_dim = max(1, int(dim * mlp_ratio))
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query: torch.Tensor, key_value: torch.Tensor):
+        q = self.query_norm(query)
+        k = self.key_norm(key_value)
+        v = self.value_norm(key_value)
+        attn_out, _ = self.attn(q, k, v, need_weights=False)
+        query = query + self.dropout(attn_out)
+        ff_out = self.ffn(self.ffn_norm(query))
+        return query + self.dropout(ff_out)
+
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout
+        )
+        hidden_dim = max(1, int(dim * mlp_ratio))
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+        x = x + self.dropout(attn_out)
+        ff_out = self.ffn(self.norm2(x))
+        return x + self.dropout(ff_out)
+
+
 class VQVAE(nn.Module):
     def __init__(
         self,
@@ -200,17 +264,43 @@ class VQVAE(nn.Module):
         gumbel_tau: float = 1.0,
         st_tau: float = 1.0,
         actor_ckpt: str | None = None,
+        attn_heads: int = 4,
+        attn_layers: int = 2,
+        attn_mlp_ratio: float = 2.0,
+        attn_dropout: float = 0.0,
     ):
         super().__init__()
-        self.encoder = Encoder(
-            input_dim=input_dim, latent_dim=latent_dim, hidden_dims=enc_hidden
-        )
         self.quantizer = VectorQuantizerEMA(n_codes=n_codes, dim=input_dim, decay=decay)
         self.actor = Actor(
             obs_dim=input_dim,
             act_dim=action_dim,
             hidden_sizes=list(actor_hidden),
         )
+        head_layers: list[nn.Module] = []
+        prev = input_dim
+        for h in head_hidden:
+            head_layers.extend([nn.Linear(prev, h), nn.GELU()])
+            prev = h
+        head_layers.append(nn.Linear(prev, n_codes))
+        self.index_head = nn.Sequential(*head_layers)
+        self.cross_attention = CrossAttentionBlock(
+            dim=input_dim,
+            num_heads=attn_heads,
+            mlp_ratio=attn_mlp_ratio,
+            dropout=attn_dropout,
+        )
+        self.attention_blocks = nn.ModuleList(
+            [
+                SelfAttentionBlock(
+                    dim=input_dim,
+                    num_heads=attn_heads,
+                    mlp_ratio=attn_mlp_ratio,
+                    dropout=attn_dropout,
+                )
+                for _ in range(attn_layers)
+            ]
+        )
+
         if actor_ckpt is None:
             raise ValueError(
                 "actor_ckpt must be provided to load the frozen actor state."
@@ -238,20 +328,24 @@ class VQVAE(nn.Module):
         self.actor.eval()
         for param in self.actor.parameters():
             param.requires_grad = False
-        head_layers: list[nn.Module] = []
-        prev = latent_dim
-        for h in head_hidden:
-            head_layers.extend([nn.Linear(prev, h), nn.GELU()])
-            prev = h
-        head_layers.append(nn.Linear(prev, n_codes))
-        self.index_head = nn.Sequential(*head_layers)
+
         self.beta = beta
         self.action_dim = action_dim
         self.gumbel_tau = gumbel_tau
         self.st_tau = st_tau
 
     def forward(self, x):  # x: [B, input_dim]
-        z_e = self.encoder(x)
+        batch_size = x.size(0)
+        query = x.unsqueeze(1)  # [B, 1, D]
+        codebook = (
+            self.quantizer.codebook.detach()
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+        )  # [B, n_codes, D]
+        z_tokens = self.cross_attention(query, codebook)
+        for block in self.attention_blocks:
+            z_tokens = block(z_tokens)
+        z_e = z_tokens.squeeze(1)
         logits = self.index_head(z_e)
         assignments = F.gumbel_softmax(logits, tau=self.gumbel_tau, hard=True)
         predicted_indices = assignments.argmax(dim=-1)
@@ -263,7 +357,7 @@ class VQVAE(nn.Module):
             usage,
             used_indices,
             assignments_out,
-        ) = self.quantizer(x, indices=predicted_indices, assignments=assignments)
+        ) = self.quantizer(z_e, indices=predicted_indices, assignments=assignments)
         dist = self.actor(z_q.float())
         return (
             dist,
