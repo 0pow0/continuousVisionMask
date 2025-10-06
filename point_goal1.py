@@ -174,7 +174,7 @@ class VectorQuantizerEMA(nn.Module):
         z_q_st = z_q_st.to(orig_dtype)
         avg_probs = encodings.float().mean(0)
         perplexity = torch.exp(-(avg_probs * (avg_probs + 1e-10).log()).sum())
-        usage = (avg_probs > 0).float().mean()
+        usage = (avg_probs > 1e-3).float().mean()
         return (
             z_q_st,
             commitment_loss,
@@ -210,14 +210,16 @@ class CrossAttentionBlock(nn.Module):
         self.ffn_norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query: torch.Tensor, key_value: torch.Tensor):
+    def forward(
+        self, query: torch.Tensor, key_value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.query_norm(query)
         k = self.key_norm(key_value)
         v = self.value_norm(key_value)
-        attn_out, _ = self.attn(q, k, v, need_weights=False)
+        attn_out, attn_weights = self.attn(q, k, v, need_weights=True)
         query = query + self.dropout(attn_out)
         ff_out = self.ffn(self.ffn_norm(query))
-        return query + self.dropout(ff_out)
+        return query + self.dropout(ff_out), attn_weights
 
 
 class SelfAttentionBlock(nn.Module):
@@ -276,13 +278,6 @@ class VQVAE(nn.Module):
             act_dim=action_dim,
             hidden_sizes=list(actor_hidden),
         )
-        head_layers: list[nn.Module] = []
-        prev = input_dim
-        for h in head_hidden:
-            head_layers.extend([nn.Linear(prev, h), nn.GELU()])
-            prev = h
-        head_layers.append(nn.Linear(prev, n_codes))
-        self.index_head = nn.Sequential(*head_layers)
         self.cross_attention = CrossAttentionBlock(
             dim=input_dim,
             num_heads=attn_heads,
@@ -338,36 +333,15 @@ class VQVAE(nn.Module):
         batch_size = x.size(0)
         query = x.unsqueeze(1)  # [B, 1, D]
         codebook = (
-            self.quantizer.codebook.detach()
-            .unsqueeze(0)
-            .expand(batch_size, -1, -1)
+            self.quantizer.codebook.unsqueeze(0).expand(batch_size, -1, -1)
         )  # [B, n_codes, D]
-        z_tokens = self.cross_attention(query, codebook)
+        z_tokens, _ = self.cross_attention(query, codebook)
         for block in self.attention_blocks:
             z_tokens = block(z_tokens)
         z_e = z_tokens.squeeze(1)
-        logits = self.index_head(z_e)
-        assignments = F.gumbel_softmax(logits, tau=self.gumbel_tau, hard=True)
-        predicted_indices = assignments.argmax(dim=-1)
-        torch.set_printoptions(threshold=torch.inf)
-        (
-            z_q,
-            commit_loss,
-            perplexity,
-            usage,
-            used_indices,
-            assignments_out,
-        ) = self.quantizer(z_e, indices=predicted_indices, assignments=assignments)
-        dist = self.actor(z_q.float())
-        return (
-            dist,
-            commit_loss,
-            perplexity,
-            usage,
-            used_indices,
-            logits,
-            assignments_out,
-        )
+        commit_loss = F.mse_loss(z_e, query.squeeze(1).detach())
+        dist = self.actor(z_e.float())
+        return dist, commit_loss
 
 
 # ---------------------------
@@ -712,7 +686,7 @@ def train(cfg: Config):
         for epoch in range(start_epoch, cfg.epochs):
             model.train()
             kl_loss.set_epoch(epoch)
-            running_nll, running_commit, running_ppl = 0.0, 0.0, 0.0
+            running_nll, running_commit = 0.0, 0.0
             progress = tqdm(
                 train_loader,
                 desc=f"Epoch {epoch+1}/{cfg.epochs}",
@@ -723,15 +697,7 @@ def train(cfg: Config):
                 target_mean = batch[1].to(device, non_blocking=True)
                 target_std = batch[2].to(device, non_blocking=True)
 
-                (
-                    dist,
-                    commit_loss,
-                    perplexity,
-                    usage,
-                    predicted_indices,
-                    index_logits,
-                    index_assignments,
-                ) = model(vecs)
+                dist, commit_loss = model(vecs)
                 pred_mean = dist.mean
                 pred_std = dist.stddev
 
@@ -759,15 +725,12 @@ def train(cfg: Config):
 
                 running_nll += nll.item()
                 running_commit += commit_loss.item()
-                running_ppl += float(perplexity)
 
                 if wandb_run is not None:
                     wandb_run.log(
                         {
                             "train/nll": float(nll.item()),
                             "train/commit": float(commit_loss.item()),
-                            "train/perplexity": float(perplexity),
-                            "train/usage": float(usage),
                             "train/lr": lr,
                             "train/mse_mean": kl_info.get("mse_mean", 0.0),
                             "train/mse_std": kl_info.get("mse_std", 0.0),
@@ -779,13 +742,10 @@ def train(cfg: Config):
 
                 avg_nll = running_nll / (i + 1)
                 avg_commit = running_commit / (i + 1)
-                avg_ppl = running_ppl / (i + 1)
                 progress.set_postfix(
                     lr=f"{lr:.3e}",
                     nll=f"{avg_nll:.6f}",
                     commit=f"{avg_commit:.6f}",
-                    ppl=f"{avg_ppl:.2f}",
-                    usage=f"{usage.item():.2f}",
                 )
 
                 global_step += 1
@@ -804,10 +764,7 @@ def train(cfg: Config):
             if val_loader is not None:
                 total_nll = 0.0
                 total_commit = 0.0
-                total_ppl = 0.0
-                total_usage = 0.0
                 total_examples = 0
-                total_batches = 0
                 total_mse_mean = 0.0
                 total_mse_std = 0.0
                 total_kl = 0.0
@@ -815,15 +772,7 @@ def train(cfg: Config):
                     vecs_v = v_batch[0].to(device, non_blocking=True)
                     mean_v = v_batch[1].to(device, non_blocking=True)
                     std_v = v_batch[2].to(device, non_blocking=True)
-                    (
-                        dist_v,
-                        commit_loss_v,
-                        perplexity_v,
-                        usage_v,
-                        _,
-                        _,
-                        _,
-                    ) = model(vecs_v)
+                    dist_v, commit_loss_v = model(vecs_v)
                     pred_mean_v = dist_v.mean
                     pred_std_v = dist_v.stddev
                     kl_val, kl_info_val = kl_loss(
@@ -835,10 +784,7 @@ def train(cfg: Config):
                     bs = vecs_v.size(0)
                     total_nll += kl_val.item() * bs
                     total_commit += commit_loss_v.item() * bs
-                    total_ppl += float(perplexity_v) * bs
-                    total_usage += float(usage_v) * bs
                     total_examples += bs
-                    total_batches += 1
                     total_mse_mean += kl_info_val["mse_mean"] * bs
                     total_mse_std += kl_info_val["mse_std"] * bs
                     total_kl += kl_info_val["kl"] * bs
@@ -846,8 +792,6 @@ def train(cfg: Config):
                     val_metrics = {
                         "val/nll": total_nll / total_examples,
                         "val/commit": total_commit / total_examples,
-                        "val/perplexity": total_ppl / total_examples,
-                        "val/usage": total_usage / total_examples,
                     }
                     if total_examples > 0:
                         val_metrics["val/mse_mean"] = total_mse_mean / total_examples
@@ -863,15 +807,7 @@ def train(cfg: Config):
             batch_vecs = batch_full[0][:64].to(device)
             batch_mean = batch_full[1][:64].to(device)
             batch_std = batch_full[2][:64].to(device)
-            (
-                dist,
-                commit_loss,
-                perplexity,
-                usage,
-                predicted_indices,
-                index_logits,
-                index_assignments,
-            ) = model(batch_vecs)
+            dist, commit_loss = model(batch_vecs)
             dist_mean = dist.mean
             dist_std = dist.stddev
             # Save a few example pairs to .pt (tensor) for quick inspection
@@ -883,23 +819,10 @@ def train(cfg: Config):
                     "dist_std": dist_std.cpu(),
                     "target_mean": batch_mean.cpu(),
                     "target_std": batch_std.cpu(),
-                    "indices": predicted_indices.cpu(),
-                    "logits": index_logits.cpu(),
-                    "assignments": (
-                        index_assignments.cpu()
-                        if index_assignments is not None
-                        else None
-                    ),
-                    "perplexity": float(perplexity),
-                    "usage": float(usage),
                     "commit_loss": float(commit_loss.item()),
                 },
                 os.path.join(cfg.sample_dir, f"actor_epoch_{epoch+1:03d}.pt"),
             )
-            with open(
-                os.path.join(cfg.sample_dir, f"code_usage_epoch_{epoch+1:03d}.txt"), "w"
-            ) as f:
-                f.write(f"perplexity={float(perplexity):.2f} usage={float(usage):.4f}")
 
         # Save checkpoint
         save_ckpt(
