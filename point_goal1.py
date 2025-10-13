@@ -140,49 +140,33 @@ class VectorQuantizerEMA(nn.Module):
         )
         self.codebook.data.copy_(self.embed_avg / cluster_size.unsqueeze(1))
 
-    def forward(
-        self,
-        z_e: torch.Tensor,
-        indices: torch.Tensor,
-        assignments: torch.Tensor,
-    ):
+    def forward(self, z_e: torch.Tensor):
         orig_dtype = z_e.dtype
         z_e_fp32 = z_e.float()
-        assignments_fp32 = assignments.float()
         if z_e_fp32.dim() != 2:
             raise ValueError("VectorQuantizerEMA expects inputs of shape [B, D]")
         B, D = z_e_fp32.shape
-        z_flat = z_e_fp32
-        reshape_indices = lambda idx: idx.view(B)
-        reshape_assignments = lambda a: a.view(B, self.n_codes)
-
         codebook = self.codebook.float()
-        assignments_flat = assignments_fp32.reshape(-1, self.n_codes).to(z_flat.dtype)
-        indices_flat = indices.reshape(-1).long()
-        z_q_flat = assignments_flat @ codebook
-        z_q = z_q_flat
-        assignments_out = reshape_assignments(assignments_flat).to(orig_dtype)
+        distances = (
+            z_e_fp32.pow(2).sum(dim=1, keepdim=True)
+            + codebook.pow(2).sum(dim=1)
+            - 2 * z_e_fp32 @ codebook.t()
+        )
+        indices = torch.argmin(distances, dim=1)
+        encodings = F.one_hot(indices, self.n_codes).type(z_e_fp32.dtype)
+        z_q = F.embedding(indices, codebook)
 
         with torch.no_grad():
-            encodings = F.one_hot(indices_flat, self.n_codes).type_as(z_flat)
-            self._ema_update(encodings, z_flat)
+            self._ema_update(encodings, z_e_fp32)
 
-        commitment_loss = F.mse_loss(z_e_fp32.detach().view(-1, D), z_q_flat)
-        # z_q_st = z_e_fp32 + (z_q - z_e_fp32).detach()
-        z_q_st = z_q
+        commitment_loss = F.mse_loss(z_e_fp32.detach(), z_q)
+        z_q_st = z_e_fp32 + (z_q - z_e_fp32).detach()
         z_q = z_q.to(orig_dtype)
         z_q_st = z_q_st.to(orig_dtype)
-        avg_probs = encodings.float().mean(0)
+        avg_probs = encodings.mean(0)
         perplexity = torch.exp(-(avg_probs * (avg_probs + 1e-10).log()).sum())
         usage = (avg_probs > 1e-3).float().mean()
-        return (
-            z_q_st,
-            commitment_loss,
-            perplexity,
-            usage,
-            reshape_indices(indices_flat),
-            assignments_out,
-        )
+        return z_q_st, commitment_loss, perplexity, usage, indices, encodings.to(orig_dtype)
 
 
 class CrossAttentionBlock(nn.Module):
@@ -278,24 +262,6 @@ class VQVAE(nn.Module):
             act_dim=action_dim,
             hidden_sizes=list(actor_hidden),
         )
-        self.cross_attention = CrossAttentionBlock(
-            dim=input_dim,
-            num_heads=attn_heads,
-            mlp_ratio=attn_mlp_ratio,
-            dropout=attn_dropout,
-        )
-        self.attention_blocks = nn.ModuleList(
-            [
-                SelfAttentionBlock(
-                    dim=input_dim,
-                    num_heads=attn_heads,
-                    mlp_ratio=attn_mlp_ratio,
-                    dropout=attn_dropout,
-                )
-                for _ in range(attn_layers)
-            ]
-        )
-
         if actor_ckpt is None:
             raise ValueError(
                 "actor_ckpt must be provided to load the frozen actor state."
@@ -330,17 +296,8 @@ class VQVAE(nn.Module):
         self.st_tau = st_tau
 
     def forward(self, x):  # x: [B, input_dim]
-        batch_size = x.size(0)
-        query = x.unsqueeze(1)  # [B, 1, D]
-        codebook = (
-            self.quantizer.codebook.unsqueeze(0).expand(batch_size, -1, -1)
-        )  # [B, n_codes, D]
-        z_tokens, _ = self.cross_attention(query, codebook)
-        for block in self.attention_blocks:
-            z_tokens = block(z_tokens)
-        z_e = z_tokens.squeeze(1)
-        commit_loss = F.mse_loss(z_e, query.squeeze(1).detach())
-        dist = self.actor(z_e.float())
+        z_q, commit_loss, _, _, _, _ = self.quantizer(x)
+        dist = self.actor(z_q.float())
         return dist, commit_loss
 
 
