@@ -45,11 +45,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Distribution
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, utils as vutils
 from tqdm.auto import tqdm
 
 from actor import Actor
+from metrics import Insertion, Deletion
 
 
 # ---------------------------
@@ -298,7 +300,7 @@ class VQVAE(nn.Module):
     def forward(self, x):  # x: [B, input_dim]
         z_q, commit_loss, _, _, _, _ = self.quantizer(x)
         dist = self.actor(z_q.float())
-        return dist, commit_loss
+        return dist, commit_loss, z_q
 
 
 # ---------------------------
@@ -492,10 +494,6 @@ def kl_divergence_gaussian(
     # 默认返回 batch 平均 KL
     return kl
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 class GaussianMSEKLLoss(nn.Module):
     def __init__(self, alpha=1.0, beta=0.1, gamma_max=1.0, min_std=1e-3, 
@@ -638,6 +636,29 @@ def train(cfg: Config):
     warmup_steps = int(0.02 * total_steps)
 
     kl_loss = GaussianMSEKLLoss(alpha=1.0, beta=1.0, min_std=1e-6)
+    def make_insertion_output_transform(target_mean, target_std):
+        target_mean = target_mean.detach()
+        target_std = target_std.detach()
+
+        def transform(output):
+            primary = output[0] if isinstance(output, (tuple, list)) else output
+            if not isinstance(primary, Distribution):
+                raise TypeError("Insertion output transform expects a torch.distributions.Distribution as the first element.")
+            pred_mean = primary.mean
+            pred_std = primary.stddev
+            target_mean_local = target_mean.to(pred_mean.device)
+            target_std_local = target_std.to(pred_mean.device)
+            return kl_divergence_gaussian(
+                pred_mean=pred_mean,
+                pred_std=pred_std,
+                target_mean=target_mean_local,
+                target_std=target_std_local,
+            )
+
+        return transform
+
+    insertion = Insertion()
+    deletion = Deletion()
 
     try:
         for epoch in range(start_epoch, cfg.epochs):
@@ -654,7 +675,7 @@ def train(cfg: Config):
                 target_mean = batch[1].to(device, non_blocking=True)
                 target_std = batch[2].to(device, non_blocking=True)
 
-                dist, commit_loss = model(vecs)
+                dist, commit_loss, z_q = model(vecs)
                 pred_mean = dist.mean
                 pred_std = dist.stddev
 
@@ -725,11 +746,15 @@ def train(cfg: Config):
                 total_mse_mean = 0.0
                 total_mse_std = 0.0
                 total_kl = 0.0
-                for v_batch in val_loader:
+                sum_insertion_auc = 0.0
+                sum_deletion_auc = 0.0
+                attr_output_dir = Path(getattr(cfg, "output_dir", cfg.out_dir))
+                attr_output_dir.mkdir(parents=True, exist_ok=True)
+                for v_idx, v_batch in enumerate(val_loader):
                     vecs_v = v_batch[0].to(device, non_blocking=True)
                     mean_v = v_batch[1].to(device, non_blocking=True)
                     std_v = v_batch[2].to(device, non_blocking=True)
-                    dist_v, commit_loss_v = model(vecs_v)
+                    dist_v, commit_loss_v, z_q_v = model(vecs_v)
                     pred_mean_v = dist_v.mean
                     pred_std_v = dist_v.stddev
                     kl_val, kl_info_val = kl_loss(
@@ -745,6 +770,34 @@ def train(cfg: Config):
                     total_mse_mean += kl_info_val["mse_mean"] * bs
                     total_mse_std += kl_info_val["mse_std"] * bs
                     total_kl += kl_info_val["kl"] * bs
+                    attr_v = torch.nan_to_num(
+                        z_q_v / vecs_v,
+                        nan=0.0,
+                        posinf=1e6,
+                        neginf=-1e6,
+                    )
+                    output_transform = make_insertion_output_transform(
+                        target_mean=mean_v,
+                        target_std=std_v,
+                    )
+                    insertion.output_transform = output_transform
+                    deletion.output_transform = output_transform
+                    insertion_auc = insertion(
+                        model,
+                        vecs_v,
+                        attr_v,
+                        file_name=str(attr_output_dir / f"val_insertion_epoch_{epoch+1:03d}"),
+                        fraction=1.0,
+                    )
+                    deletion_auc = deletion(
+                        model,
+                        vecs_v,
+                        attr_v,
+                        file_name=str(attr_output_dir / f"val_deletion_epoch_{epoch+1:03d}"),
+                        fraction=1.0,
+                    )
+                    sum_insertion_auc += float(sum(insertion_auc))
+                    sum_deletion_auc += float(sum(deletion_auc))
                 if total_examples > 0:
                     val_metrics = {
                         "val/nll": total_nll / total_examples,
@@ -754,6 +807,8 @@ def train(cfg: Config):
                         val_metrics["val/mse_mean"] = total_mse_mean / total_examples
                         val_metrics["val/mse_std"] = total_mse_std / total_examples
                         val_metrics["val/kl"] = total_kl / total_examples
+                        val_metrics["val/insertion_auc"] = sum_insertion_auc / total_examples
+                        val_metrics["val/deletion_auc"] = sum_deletion_auc / total_examples
                     if wandb_run is not None:
                         wandb_run.log(val_metrics, step=global_step)
 
@@ -764,7 +819,7 @@ def train(cfg: Config):
             batch_vecs = batch_full[0][:64].to(device)
             batch_mean = batch_full[1][:64].to(device)
             batch_std = batch_full[2][:64].to(device)
-            dist, commit_loss = model(batch_vecs)
+            dist, commit_loss, z_q = model(batch_vecs)
             dist_mean = dist.mean
             dist_std = dist.stddev
             # Save a few example pairs to .pt (tensor) for quick inspection
@@ -776,6 +831,7 @@ def train(cfg: Config):
                     "dist_std": dist_std.cpu(),
                     "target_mean": batch_mean.cpu(),
                     "target_std": batch_std.cpu(),
+                    "quantized_latent": z_q.cpu(),
                     "commit_loss": float(commit_loss.item()),
                 },
                 os.path.join(cfg.sample_dir, f"actor_epoch_{epoch+1:03d}.pt"),
