@@ -15,6 +15,8 @@ class Insertion():
     def __call__(self, model, x, attr, file_name, fraction):
         actions, auc_values = self._run_curve(model, x, attr, fraction)
         self._persist_results(file_name, actions, auc_values)
+        for i, action in enumerate(actions):
+            self.plot(action, f"{file_name}_{i}.png", auc_values[i])
         return auc_values
 
     def _run_curve(self, model, x, attr, fraction):
@@ -99,7 +101,7 @@ class Insertion():
         ax.fill_between(x, actions, color='skyblue', alpha=0.3)
         ax.set_xlabel('Fractions of Pixels')
         ax.set_ylabel(r'$P(a)$')
-        ax.text(0.85, 0.9, 'AUC={:.4f}'.format(auc.item()), fontsize=12, ha='center', va='center', transform=plt.gca().transAxes)
+        ax.text(0.85, 0.9, 'AUC={:.4f}'.format(auc), fontsize=12, ha='center', va='center', transform=plt.gca().transAxes)
         plt.savefig(file_name, bbox_inches='tight')
         plt.close(fig)
 

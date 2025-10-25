@@ -748,8 +748,10 @@ def train(cfg: Config):
                 total_kl = 0.0
                 sum_insertion_auc = 0.0
                 sum_deletion_auc = 0.0
-                attr_output_dir = Path(getattr(cfg, "output_dir", cfg.out_dir))
-                attr_output_dir.mkdir(parents=True, exist_ok=True)
+                attr_output_root = Path(getattr(cfg, "output_dir", cfg.out_dir))
+                attr_output_root.mkdir(parents=True, exist_ok=True)
+                curves_output_dir = attr_output_root / "curves"
+                curves_output_dir.mkdir(parents=True, exist_ok=True)
                 for v_idx, v_batch in enumerate(val_loader):
                     vecs_v = v_batch[0].to(device, non_blocking=True)
                     mean_v = v_batch[1].to(device, non_blocking=True)
@@ -786,14 +788,14 @@ def train(cfg: Config):
                         model,
                         vecs_v,
                         attr_v,
-                        file_name=str(attr_output_dir / f"val_insertion_epoch_{epoch+1:03d}"),
+                        file_name=str(curves_output_dir / f"val_insertion_epoch_{epoch+1:03d}"),
                         fraction=1.0,
                     )
                     deletion_auc = deletion(
                         model,
                         vecs_v,
                         attr_v,
-                        file_name=str(attr_output_dir / f"val_deletion_epoch_{epoch+1:03d}"),
+                        file_name=str(curves_output_dir / f"val_deletion_epoch_{epoch+1:03d}"),
                         fraction=1.0,
                     )
                     sum_insertion_auc += float(sum(insertion_auc))
