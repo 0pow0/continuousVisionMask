@@ -12,7 +12,7 @@ class Insertion():
     def __init__(self, output_transform: Optional[Callable[[Any], torch.Tensor]] = None) -> None:
         self.output_transform = output_transform
         self._records: dict[int, dict[str, Any]] = {}
-        self._plot_queue: list[tuple[int, torch.Tensor, float]] = []
+        self._plot_order: list[int] = []
 
     def __call__(
         self,
@@ -24,8 +24,8 @@ class Insertion():
     ):
         actions, auc_values = self._run_curve(model, x, attr, fraction)
         ids = self._prepare_ids(sample_ids, actions.size(0))
-        self._accumulate_results(actions, auc_values, ids)
-        self._queue_plots(actions, auc_values, ids)
+        self._accumulate_results(actions, ids)
+        self._queue_plots(ids)
         return auc_values
 
     def _run_curve(self, model, x, attr, fraction):
@@ -94,15 +94,19 @@ class Insertion():
             raise ValueError("output_dir must be provided when flushing metrics.")
         output_root = Path(output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
+        normalized_records = self._normalize_records()
         results_path = output_root / f"{prefix}_results.pt"
-        torch.save(self._records, results_path)
+        torch.save(normalized_records, results_path)
 
-        for sample_id, actions, auc in self._plot_queue:
+        for sample_id in self._plot_order:
+            record = normalized_records.get(sample_id)
+            if not record:
+                continue
             plot_path = output_root / f"{prefix}_{sample_id}.png"
-            self._plot(actions, str(plot_path), auc)
+            self._plot(record["actions"], str(plot_path), record["auc"])
 
+        self._plot_order.clear()
         self._records.clear()
-        self._plot_queue.clear()
 
     def _prepare_ids(
         self,
@@ -124,31 +128,42 @@ class Insertion():
     def _accumulate_results(
         self,
         actions: torch.Tensor,
-        auc_values: list[float],
         sample_ids: Optional[list[int]],
     ) -> None:
         if sample_ids is None:
             return
-        record = self._records
         actions_cpu = actions.detach().cpu()
         for idx, sample_id in enumerate(sample_ids):
-            record[int(sample_id)] = {
-                'actions': actions_cpu[idx],
-                'auc': float(auc_values[idx]),
+            self._records[int(sample_id)] = {
+                "actions": actions_cpu[idx],
             }
 
     def _queue_plots(
         self,
-        actions: torch.Tensor,
-        auc_values: list[float],
         sample_ids: Optional[list[int]],
     ):
         if sample_ids is None:
             return
-        for idx, sample_id in enumerate(sample_ids):
-            self._plot_queue.append(
-                (int(sample_id), actions[idx].detach().cpu(), float(auc_values[idx]))
-            )
+        for sample_id in sample_ids:
+            self._plot_order.append(int(sample_id))
+
+    def _normalize_records(self) -> dict[int, dict[str, Any]]:
+        if not self._records:
+            return {}
+        ordered_ids = sorted(self._records.keys())
+        stacked = torch.stack([self._records[_id]["actions"] for _id in ordered_ids])
+        min_vals = stacked.min(dim=0, keepdim=True).values
+        max_vals = stacked.max(dim=0, keepdim=True).values
+        denom = (max_vals - min_vals).clamp_min(1e-8)
+        normalized = (stacked - min_vals) / denom
+        auc_values = self._compute_auc(normalized)
+        normalized_records: dict[int, dict[str, Any]] = {}
+        for idx, sample_id in enumerate(ordered_ids):
+            normalized_records[sample_id] = {
+                "actions": normalized[idx].detach().cpu(),
+                "auc": float(auc_values[idx]),
+            }
+        return normalized_records
 
     def _plot(self, actions, file_name, auc):
         os.makedirs(os.path.dirname(file_name), exist_ok=True)
