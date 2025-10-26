@@ -2,7 +2,7 @@ import torch
 import sys 
 import os
 import math
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 from torch.distributions import Distribution
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
@@ -11,12 +11,21 @@ from pathlib import Path
 class Insertion():
     def __init__(self, output_transform: Optional[Callable[[Any], torch.Tensor]] = None) -> None:
         self.output_transform = output_transform
+        self._records: dict[int, dict[str, Any]] = {}
+        self._plot_queue: list[tuple[int, torch.Tensor, float]] = []
 
-    def __call__(self, model, x, attr, file_name, fraction):
+    def __call__(
+        self,
+        model,
+        x,
+        attr,
+        fraction,
+        sample_ids: Optional[Sequence[int] | torch.Tensor] = None,
+    ):
         actions, auc_values = self._run_curve(model, x, attr, fraction)
-        self._persist_results(file_name, actions, auc_values)
-        for i, action in enumerate(actions):
-            self.plot(action, f"{file_name}_{i}.png", auc_values[i])
+        ids = self._prepare_ids(sample_ids, actions.size(0))
+        self._accumulate_results(actions, auc_values, ids)
+        self._queue_plots(actions, auc_values, ids)
         return auc_values
 
     def _run_curve(self, model, x, attr, fraction):
@@ -80,25 +89,68 @@ class Insertion():
         auc = trapezoid.sum(dim=1) / (steps - 1)
         return auc.detach().cpu().tolist()
 
-    def _persist_results(
-        self, file_name: Optional[str], actions: torch.Tensor, auc_values: list[float]
+    def flush(self, output_dir: str, prefix: str):
+        if not output_dir:
+            raise ValueError("output_dir must be provided when flushing metrics.")
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        results_path = output_root / f"{prefix}_results.pt"
+        torch.save(self._records, results_path)
+
+        for sample_id, actions, auc in self._plot_queue:
+            plot_path = output_root / f"{prefix}_{sample_id}.png"
+            self._plot(actions, str(plot_path), auc)
+
+        self._records.clear()
+        self._plot_queue.clear()
+
+    def _prepare_ids(
+        self,
+        sample_ids: Optional[Sequence[int] | torch.Tensor],
+        batch_size: int,
+    ) -> list[int] | None:
+        if sample_ids is None:
+            return None
+        if torch.is_tensor(sample_ids):
+            ids_list = sample_ids.detach().cpu().view(-1).tolist()
+        else:
+            ids_list = [int(s) for s in sample_ids]
+        if len(ids_list) != batch_size:
+            raise ValueError(
+                f"sample_ids length ({len(ids_list)}) must match batch size ({batch_size})."
+            )
+        return ids_list
+
+    def _accumulate_results(
+        self,
+        actions: torch.Tensor,
+        auc_values: list[float],
+        sample_ids: Optional[list[int]],
     ) -> None:
-        if not file_name:
+        if sample_ids is None:
             return
+        record = self._records
+        actions_cpu = actions.detach().cpu()
+        for idx, sample_id in enumerate(sample_ids):
+            record[int(sample_id)] = {
+                'actions': actions_cpu[idx],
+                'auc': float(auc_values[idx]),
+            }
 
-        path = Path(file_name)
-        if path.suffix == "":
-            path = path.with_suffix('.pt')
-        os.makedirs(path.parent, exist_ok=True)
-        torch.save(
-            {
-                'actions': actions.cpu(),
-                'auc': torch.tensor(auc_values, dtype=torch.float32),
-            },
-            path,
-        )
+    def _queue_plots(
+        self,
+        actions: torch.Tensor,
+        auc_values: list[float],
+        sample_ids: Optional[list[int]],
+    ):
+        if sample_ids is None:
+            return
+        for idx, sample_id in enumerate(sample_ids):
+            self._plot_queue.append(
+                (int(sample_id), actions[idx].detach().cpu(), float(auc_values[idx]))
+            )
 
-    def plot(self, actions, file_name, auc):
+    def _plot(self, actions, file_name, auc):
         os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
         if torch.is_tensor(actions):

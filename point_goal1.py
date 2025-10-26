@@ -337,7 +337,8 @@ def get_dataloaders_vector(
     if act_mean.shape != act_std.shape:
         raise ValueError("act_mean and act_std must share shape")
 
-    tensors = (obs, act_mean, act_std)
+    ids = x["ids"]
+    tensors = (obs, act_mean, act_std, ids)
     ds = torch.utils.data.TensorDataset(*tensors)
     # Split
     g = torch.Generator().manual_seed(seed)
@@ -767,6 +768,7 @@ def train(cfg: Config):
                     vecs_v = v_batch[0].to(device, non_blocking=True)
                     mean_v = v_batch[1].to(device, non_blocking=True)
                     std_v = v_batch[2].to(device, non_blocking=True)
+                    ids_v = v_batch[3] if len(v_batch) > 3 else None
                     dist_v, commit_loss_v, z_q_v = model(vecs_v)
                     pred_mean_v = dist_v.mean
                     pred_std_v = dist_v.stddev
@@ -799,15 +801,15 @@ def train(cfg: Config):
                         model,
                         vecs_v,
                         attr_v,
-                        file_name=str(curves_output_dir / f"val_insertion_epoch_{eval_epoch_num:03d}"),
                         fraction=1.0,
+                        sample_ids=ids_v,
                     )
                     deletion_auc = deletion(
                         model,
                         vecs_v,
                         attr_v,
-                        file_name=str(curves_output_dir / f"val_deletion_epoch_{eval_epoch_num:03d}"),
                         fraction=1.0,
+                        sample_ids=ids_v,
                     )
                     sum_insertion_auc += float(sum(insertion_auc))
                     sum_deletion_auc += float(sum(deletion_auc))
@@ -824,6 +826,14 @@ def train(cfg: Config):
                         val_metrics["val/deletion_auc"] = sum_deletion_auc / total_examples
                     if wandb_run is not None:
                         wandb_run.log(val_metrics, step=global_step)
+                insertion.flush(
+                    output_dir=str(curves_output_dir),
+                    prefix=f"val_insertion_epoch_{eval_epoch_num:03d}",
+                )
+                deletion.flush(
+                    output_dir=str(curves_output_dir),
+                    prefix=f"val_deletion_epoch_{eval_epoch_num:03d}",
+                )
 
             # Take a small batch for qualitative numeric inspection
             batch_full = next(
@@ -832,6 +842,7 @@ def train(cfg: Config):
             batch_vecs = batch_full[0][:64].to(device)
             batch_mean = batch_full[1][:64].to(device)
             batch_std = batch_full[2][:64].to(device)
+            batch_ids = batch_full[3][:64] if len(batch_full) > 3 else None
             dist, commit_loss, z_q = model(batch_vecs)
             dist_mean = dist.mean
             dist_std = dist.stddev
@@ -845,6 +856,7 @@ def train(cfg: Config):
                     "target_mean": batch_mean.cpu(),
                     "target_std": batch_std.cpu(),
                     "quantized_latent": z_q.cpu(),
+                    "ids": batch_ids.cpu() if batch_ids is not None else None,
                     "commit_loss": float(commit_loss.item()),
                 },
                 os.path.join(cfg.sample_dir, f"actor_epoch_{eval_epoch_num:03d}.pt"),
