@@ -764,7 +764,12 @@ def train(cfg: Config):
                 attr_output_root.mkdir(parents=True, exist_ok=True)
                 curves_output_dir = attr_output_root / "curves"
                 curves_output_dir.mkdir(parents=True, exist_ok=True)
-                for v_idx, v_batch in enumerate(val_loader):
+                val_progress = tqdm(
+                    val_loader,
+                    desc="Validation",
+                    leave=False,
+                )
+                for v_idx, v_batch in enumerate(val_progress):
                     vecs_v = v_batch[0].to(device, non_blocking=True)
                     mean_v = v_batch[1].to(device, non_blocking=True)
                     std_v = v_batch[2].to(device, non_blocking=True)
@@ -813,6 +818,12 @@ def train(cfg: Config):
                     )
                     sum_insertion_auc += float(sum(insertion_auc))
                     sum_deletion_auc += float(sum(deletion_auc))
+                    avg_nll_val = total_nll / max(1, total_examples)
+                    val_progress.set_postfix(
+                        nll=f"{avg_nll_val:.6f}",
+                        batches=f"{v_idx + 1}/{len(val_loader)}",
+                    )
+                val_progress.close()
                 if total_examples > 0:
                     val_metrics = {
                         "val/nll": total_nll / total_examples,
