@@ -660,74 +660,85 @@ def train(cfg: Config):
     insertion = Insertion()
     deletion = Deletion()
 
+    skip_training = cfg.resume is not None
+    last_epoch_idx = start_epoch - 1
+
     try:
-        for epoch in range(start_epoch, cfg.epochs):
-            model.train()
-            kl_loss.set_epoch(epoch)
-            running_nll, running_commit = 0.0, 0.0
-            progress = tqdm(
-                train_loader,
-                desc=f"Epoch {epoch+1}/{cfg.epochs}",
-                leave=False,
+        if skip_training:
+            print(
+                "Resume checkpoint provided; skipping training loop and running validation only."
             )
-            for i, batch in enumerate(progress):
-                vecs = batch[0].to(device, non_blocking=True)
-                target_mean = batch[1].to(device, non_blocking=True)
-                target_std = batch[2].to(device, non_blocking=True)
-
-                dist, commit_loss, z_q = model(vecs)
-                pred_mean = dist.mean
-                pred_std = dist.stddev
-
-                kl_value, kl_info = kl_loss(
-                    pred_mean=pred_mean,
-                    pred_std=pred_std,
-                    target_mean=target_mean,
-                    target_std=target_std,
+        else:
+            for epoch in range(start_epoch, cfg.epochs):
+                last_epoch_idx = epoch
+                model.train()
+                kl_loss.set_epoch(epoch)
+                running_nll, running_commit = 0.0, 0.0
+                progress = tqdm(
+                    train_loader,
+                    desc=f"Epoch {epoch+1}/{cfg.epochs}",
+                    leave=False,
                 )
+                for i, batch in enumerate(progress):
+                    vecs = batch[0].to(device, non_blocking=True)
+                    target_mean = batch[1].to(device, non_blocking=True)
+                    target_std = batch[2].to(device, non_blocking=True)
 
-                nll = kl_value
-                loss = nll + cfg.beta * commit_loss
+                    dist, commit_loss, z_q = model(vecs)
+                    pred_mean = dist.mean
+                    pred_std = dist.stddev
 
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                if cfg.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                opt.step()
-
-                if ema is not None:
-                    ema.update(model)
-
-                # LR schedule
-                lr = cosine_warmup_lr(opt, cfg.lr, warmup_steps, total_steps, global_step)
-
-                running_nll += nll.item()
-                running_commit += commit_loss.item()
-
-                if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "train/nll": float(nll.item()),
-                            "train/commit": float(commit_loss.item()),
-                            "train/lr": lr,
-                            "train/mse_mean": kl_info.get("mse_mean", 0.0),
-                            "train/mse_std": kl_info.get("mse_std", 0.0),
-                            "train/kl": kl_info.get("kl", 0.0),
-                            "train/gamma": kl_info.get("gamma", 0.0),
-                        },
-                        step=global_step,
+                    kl_value, kl_info = kl_loss(
+                        pred_mean=pred_mean,
+                        pred_std=pred_std,
+                        target_mean=target_mean,
+                        target_std=target_std,
                     )
 
-                avg_nll = running_nll / (i + 1)
-                avg_commit = running_commit / (i + 1)
-                progress.set_postfix(
-                    lr=f"{lr:.3e}",
-                    nll=f"{avg_nll:.6f}",
-                    commit=f"{avg_commit:.6f}",
-                )
+                    nll = kl_value
+                    loss = nll + cfg.beta * commit_loss
 
-                global_step += 1
-        progress.close()
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    if cfg.grad_clip > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    opt.step()
+
+                    if ema is not None:
+                        ema.update(model)
+
+                    # LR schedule
+                    lr = cosine_warmup_lr(opt, cfg.lr, warmup_steps, total_steps, global_step)
+
+                    running_nll += nll.item()
+                    running_commit += commit_loss.item()
+
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "train/nll": float(nll.item()),
+                                "train/commit": float(commit_loss.item()),
+                                "train/lr": lr,
+                                "train/mse_mean": kl_info.get("mse_mean", 0.0),
+                                "train/mse_std": kl_info.get("mse_std", 0.0),
+                                "train/kl": kl_info.get("kl", 0.0),
+                                "train/gamma": kl_info.get("gamma", 0.0),
+                            },
+                            step=global_step,
+                        )
+
+                    avg_nll = running_nll / (i + 1)
+                    avg_commit = running_commit / (i + 1)
+                    progress.set_postfix(
+                        lr=f"{lr:.3e}",
+                        nll=f"{avg_nll:.6f}",
+                        commit=f"{avg_commit:.6f}",
+                    )
+
+                    global_step += 1
+                progress.close()
+
+        eval_epoch_num = max(last_epoch_idx + 1, 1)
 
         # Validation / Sampling
         model.eval()
@@ -775,7 +786,7 @@ def train(cfg: Config):
                     attr_v = torch.nan_to_num(
                         z_q_v / vecs_v,
                         nan=0.0,
-                        posinf=1e6,
+                        posinf=-1e6,
                         neginf=-1e6,
                     )
                     output_transform = make_insertion_output_transform(
@@ -788,14 +799,14 @@ def train(cfg: Config):
                         model,
                         vecs_v,
                         attr_v,
-                        file_name=str(curves_output_dir / f"val_insertion_epoch_{epoch+1:03d}"),
+                        file_name=str(curves_output_dir / f"val_insertion_epoch_{eval_epoch_num:03d}"),
                         fraction=1.0,
                     )
                     deletion_auc = deletion(
                         model,
                         vecs_v,
                         attr_v,
-                        file_name=str(curves_output_dir / f"val_deletion_epoch_{epoch+1:03d}"),
+                        file_name=str(curves_output_dir / f"val_deletion_epoch_{eval_epoch_num:03d}"),
                         fraction=1.0,
                     )
                     sum_insertion_auc += float(sum(insertion_auc))
@@ -836,18 +847,19 @@ def train(cfg: Config):
                     "quantized_latent": z_q.cpu(),
                     "commit_loss": float(commit_loss.item()),
                 },
-                os.path.join(cfg.sample_dir, f"actor_epoch_{epoch+1:03d}.pt"),
+                os.path.join(cfg.sample_dir, f"actor_epoch_{eval_epoch_num:03d}.pt"),
             )
 
-        # Save checkpoint
-        save_ckpt(
-            os.path.join(cfg.out_dir, f"epoch_{epoch+1:03d}.pt"),
-            model,
-            opt,
-            epoch + 1,
-            global_step,
-            cfg,
-        )
+        # Save checkpoint only if training ran in this invocation
+        if not skip_training:
+            save_ckpt(
+                os.path.join(cfg.out_dir, f"epoch_{eval_epoch_num:03d}.pt"),
+                model,
+                opt,
+                eval_epoch_num,
+                global_step,
+                cfg,
+            )
     finally:
         if wandb_run is not None:
             wandb_run.finish()

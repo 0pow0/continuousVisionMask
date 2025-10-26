@@ -38,7 +38,13 @@ class Insertion():
 
         actions = x.new_zeros((B, N + 1))
 
+        # print(f"{attr.shape} {x.shape=}")
+        # print(f"{x[0]=}")
+        # print(f"{attr[0]=}")
         sorted_indices = torch.argsort(flat_attr, descending=True, dim=1)
+        # print(f"{sorted_indices[0]=}")
+        # print(f"{attr[0][sorted_indices[0]]=}")
+        # print(f"{x[0][sorted_indices[0]]=}")
 
         masked_x = mask * x
         out = model(masked_x)
@@ -95,6 +101,8 @@ class Insertion():
     def plot(self, actions, file_name, auc):
         os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
+        if torch.is_tensor(actions):
+            actions = actions.detach().cpu().numpy()
         x = [ (k / len(actions)) for k in range(len(actions)) ]
         fig, ax = plt.subplots()
         ax.plot(x, actions, color='#376795')
