@@ -401,6 +401,7 @@ class Config:
     sample_dir: str = "./samples"
     resume: str | None = None
     seed: int = 42
+    plot_metrics: bool = True
 
 
 class ModelEMA:
@@ -658,8 +659,8 @@ def train(cfg: Config):
 
         return transform
 
-    insertion = Insertion()
-    deletion = Deletion()
+    insertion = Insertion(enable_plots=cfg.plot_metrics)
+    deletion = Deletion(enable_plots=cfg.plot_metrics)
 
     skip_training = cfg.resume is not None
     last_epoch_idx = start_epoch - 1
@@ -758,8 +759,6 @@ def train(cfg: Config):
                 total_mse_mean = 0.0
                 total_mse_std = 0.0
                 total_kl = 0.0
-                sum_insertion_auc = 0.0
-                sum_deletion_auc = 0.0
                 attr_output_root = Path(getattr(cfg, "output_dir", cfg.out_dir))
                 attr_output_root.mkdir(parents=True, exist_ok=True)
                 curves_output_dir = attr_output_root / "curves"
@@ -816,14 +815,28 @@ def train(cfg: Config):
                         fraction=1.0,
                         sample_ids=ids_v,
                     )
-                    sum_insertion_auc += float(sum(insertion_auc))
-                    sum_deletion_auc += float(sum(deletion_auc))
                     avg_nll_val = total_nll / max(1, total_examples)
                     val_progress.set_postfix(
                         nll=f"{avg_nll_val:.6f}",
                         batches=f"{v_idx + 1}/{len(val_loader)}",
                     )
                 val_progress.close()
+                normalized_insertion = insertion.flush(
+                    output_dir=str(curves_output_dir),
+                    prefix=f"val_insertion_epoch_{eval_epoch_num:03d}",
+                )
+                normalized_deletion = deletion.flush(
+                    output_dir=str(curves_output_dir),
+                    prefix=f"val_deletion_epoch_{eval_epoch_num:03d}",
+                )
+
+                def mean_auc(records):
+                    if not records:
+                        return 0.0
+                    return sum(item.get("auc", 0.0) for item in records.values()) / max(
+                        1, len(records)
+                    )
+
                 if total_examples > 0:
                     val_metrics = {
                         "val/nll": total_nll / total_examples,
@@ -833,18 +846,10 @@ def train(cfg: Config):
                         val_metrics["val/mse_mean"] = total_mse_mean / total_examples
                         val_metrics["val/mse_std"] = total_mse_std / total_examples
                         val_metrics["val/kl"] = total_kl / total_examples
-                        val_metrics["val/insertion_auc"] = sum_insertion_auc / total_examples
-                        val_metrics["val/deletion_auc"] = sum_deletion_auc / total_examples
+                        val_metrics["val/insertion_auc"] = mean_auc(normalized_insertion)
+                        val_metrics["val/deletion_auc"] = mean_auc(normalized_deletion)
                     if wandb_run is not None:
                         wandb_run.log(val_metrics, step=global_step)
-                insertion.flush(
-                    output_dir=str(curves_output_dir),
-                    prefix=f"val_insertion_epoch_{eval_epoch_num:03d}",
-                )
-                deletion.flush(
-                    output_dir=str(curves_output_dir),
-                    prefix=f"val_deletion_epoch_{eval_epoch_num:03d}",
-                )
 
             # Take a small batch for qualitative numeric inspection
             batch_full = next(
@@ -964,6 +969,11 @@ if __name__ == "__main__":
     p.add_argument("--sample-dir", type=str, default="./samples")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--no-plot-metrics",
+        action="store_true",
+        help="Disable insertion/deletion curve plotting to speed up evaluation.",
+    )
 
     args = p.parse_args()
     cfg = Config(
@@ -989,6 +999,7 @@ if __name__ == "__main__":
         sample_dir=args.sample_dir,
         resume=args.resume,
         seed=args.seed,
+        plot_metrics=not args.no_plot_metrics,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

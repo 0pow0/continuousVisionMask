@@ -9,8 +9,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 class Insertion():
-    def __init__(self, output_transform: Optional[Callable[[Any], torch.Tensor]] = None) -> None:
+    def __init__(
+        self,
+        output_transform: Optional[Callable[[Any], torch.Tensor]] = None,
+        enable_plots: bool = True,
+    ) -> None:
         self.output_transform = output_transform
+        self.enable_plots = enable_plots
         self._records: dict[int, dict[str, Any]] = {}
         self._plot_order: list[int] = []
 
@@ -89,24 +94,28 @@ class Insertion():
         auc = trapezoid.sum(dim=1) / (steps - 1)
         return auc.detach().cpu().tolist()
 
-    def flush(self, output_dir: str, prefix: str):
+    def flush(self, output_dir: str, prefix: str) -> dict[int, dict[str, Any]]:
         if not output_dir:
             raise ValueError("output_dir must be provided when flushing metrics.")
+        if not self._records:
+            return {}
         output_root = Path(output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
         normalized_records = self._normalize_records()
         results_path = output_root / f"{prefix}_results.pt"
         torch.save(normalized_records, results_path)
 
-        for sample_id in self._plot_order:
-            record = normalized_records.get(sample_id)
-            if not record:
-                continue
-            plot_path = output_root / f"{prefix}_{sample_id}.png"
-            self._plot(record["actions"], str(plot_path), record["auc"])
+        if self.enable_plots:
+            for sample_id in self._plot_order:
+                record = normalized_records.get(sample_id)
+                if not record:
+                    continue
+                plot_path = output_root / f"{prefix}_{sample_id}.png"
+                self._plot(record["actions"], str(plot_path), record["auc"])
 
-        self._plot_order.clear()
+            self._plot_order.clear()
         self._records.clear()
+        return normalized_records
 
     def _prepare_ids(
         self,
@@ -142,7 +151,7 @@ class Insertion():
         self,
         sample_ids: Optional[list[int]],
     ):
-        if sample_ids is None:
+        if sample_ids is None or not self.enable_plots:
             return
         for sample_id in sample_ids:
             self._plot_order.append(int(sample_id))
