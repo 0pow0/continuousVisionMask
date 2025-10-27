@@ -337,7 +337,7 @@ def get_dataloaders_vector(
     if act_mean.shape != act_std.shape:
         raise ValueError("act_mean and act_std must share shape")
 
-    ids = x["ids"]
+    ids = x["sample_id"]
     tensors = (obs, act_mean, act_std, ids)
     ds = torch.utils.data.TensorDataset(*tensors)
     # Split
