@@ -29,7 +29,7 @@ class Insertion():
     ):
         actions, auc_values = self._run_curve(model, x, attr, fraction)
         ids = self._prepare_ids(sample_ids, actions.size(0))
-        self._accumulate_results(actions, ids)
+        self._accumulate_results(actions, attr, ids)
         self._queue_plots(ids)
         return auc_values
 
@@ -137,14 +137,17 @@ class Insertion():
     def _accumulate_results(
         self,
         actions: torch.Tensor,
+        attr: torch.Tensor,
         sample_ids: Optional[list[int]],
     ) -> None:
         if sample_ids is None:
             return
         actions_cpu = actions.detach().cpu()
+        attr_cpu = attr.detach().cpu()
         for idx, sample_id in enumerate(sample_ids):
             self._records[int(sample_id)] = {
                 "actions": actions_cpu[idx],
+                "attr": attr_cpu[idx],
             }
 
     def _queue_plots(
@@ -171,6 +174,7 @@ class Insertion():
             normalized_records[sample_id] = {
                 "actions": normalized[idx].detach().cpu(),
                 "auc": float(auc_values[idx]),
+                "attr": self._records[sample_id]["attr"],
             }
         return normalized_records
 
