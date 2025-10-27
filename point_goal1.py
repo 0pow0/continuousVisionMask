@@ -802,14 +802,14 @@ def train(cfg: Config):
                     insertion.output_transform = output_transform
                     deletion.output_transform = output_transform
                     insertion_auc = insertion(
-                        model,
+                        model.actor,
                         vecs_v,
                         attr_v,
                         fraction=1.0,
                         sample_ids=ids_v,
                     )
                     deletion_auc = deletion(
-                        model,
+                        model.actor,
                         vecs_v,
                         attr_v,
                         fraction=1.0,

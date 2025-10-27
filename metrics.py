@@ -161,8 +161,8 @@ class Insertion():
             return {}
         ordered_ids = sorted(self._records.keys())
         stacked = torch.stack([self._records[_id]["actions"] for _id in ordered_ids])
-        min_vals = stacked.min(dim=0, keepdim=True).values
-        max_vals = stacked.max(dim=0, keepdim=True).values
+        min_vals = stacked.min(dim=1, keepdim=True).values
+        max_vals = stacked.max(dim=1, keepdim=True).values
         denom = (max_vals - min_vals).clamp_min(1e-8)
         normalized = (stacked - min_vals) / denom
         auc_values = self._compute_auc(normalized)
