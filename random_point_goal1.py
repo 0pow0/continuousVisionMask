@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-SHAP Baseline Evaluation for the PointGoal1 Actor
--------------------------------------------------
+Random Attribution Baseline for PointGoal1
+------------------------------------------
 
-This script mirrors the evaluation pipeline in point_goal1.py but replaces the
-learned attribution coming from the VQ-VAE encoder with SHAP values computed on
-top of the frozen actor. The resulting attributions are fed into the same
-Insertion/Deletion metrics so they can be compared apples-to-apples with the
-model-based explanations.
+Uses randomly generated attribution scores (independent of the actor) to feed
+the existing Insertion/Deletion metrics. Serves as a sanity baseline alongside
+the learned attribution (point_goal1.py) and SHAP baseline.
 """
 from __future__ import annotations
 
@@ -19,105 +17,28 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution
-from tqdm.auto import tqdm
-
-try:
-    import shap  # type: ignore
-except ImportError as exc:  # pragma: no cover - makes failure mode explicit
-    raise ImportError(
-        "shap_point_goal1.py requires the 'shap' package. "
-        "Install it with `pip install shap` and re-run."
-    ) from exc
 
 from actor import Actor
 from metrics import Insertion, Deletion
-from point_goal1 import (
-    get_dataloaders_vector,
-    kl_divergence_gaussian,
-    set_seed,
-)
+from point_goal1 import get_dataloaders_vector, kl_divergence_gaussian, set_seed
 
 
 @dataclass
-class SHAPConfig:
+class RandomConfig:
     data_path: str = "./data/vectors.npy"
     actor_ckpt: str | None = None
     actor_hidden: tuple[int, ...] = (64, 64)
     batch_size: int = 256
     num_workers: int = 8
-    background_size: int = 512
     eval_batches: int | None = None
     insertion_fraction: float = 1.0
     seed: int = 42
-    out_dir: str = "./shap_outputs"
+    attr_strategy: str = "normal"
+    normalize_attr: bool = False
+    out_dir: str = "./random_outputs"
     plot_metrics: bool = True
-
-
-class ActorMeanHead(nn.Module):
-    """Lightweight wrapper that exposes the actor's mean for SHAP."""
-
-    def __init__(self, actor: Actor):
-        super().__init__()
-        self.actor = actor
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.actor(obs).mean
-
-
-def make_output_transform(target_mean: torch.Tensor, target_std: torch.Tensor):
-    target_mean = target_mean.detach()
-    target_std = target_std.detach()
-
-    def transform(output):
-        primary = output[0] if isinstance(output, (tuple, list)) else output
-        if not isinstance(primary, Distribution):
-            raise TypeError(
-                "Insertion/Deletion output transform expects a Distribution."
-            )
-        pred_mean = primary.mean
-        pred_std = primary.stddev
-        return kl_divergence_gaussian(
-            pred_mean=pred_mean,
-            pred_std=pred_std,
-            target_mean=target_mean.to(pred_mean.device),
-            target_std=target_std.to(pred_mean.device),
-        )
-
-    return transform
-
-
-def aggregate_shap_values(
-    shap_values: Iterable[torch.Tensor] | list,
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Collapses SHAP values (list per-action or tensor) into a single attribution
-    matching the input shape. Absolute contributions are averaged across action
-    dimensions so the attribution remains non-negative for ranking.
-    """
-    device = reference.device
-    dtype = reference.dtype
-
-    def reduce_dim(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dim() == 3:
-            return tensor.mean(dim=-1)
-
-    if isinstance(shap_values, list):
-        tensors = [
-            torch.as_tensor(sv, device=device, dtype=dtype) for sv in shap_values
-        ]
-        stacked = torch.stack(tensors, dim=1)  # [B, act_dim, D]
-        attr = reduce_dim(stacked)
-    else:
-        tmp = torch.as_tensor(shap_values, device=device, dtype=dtype)
-        attr = reduce_dim(tmp)
-
-    if attr.shape != reference.shape:
-        attr = attr.reshape_as(reference)
-    return attr
 
 
 def load_actor_state(
@@ -153,35 +74,58 @@ def load_actor_state(
     return actor
 
 
-@torch.no_grad()
-def collect_background(
-    loader: torch.utils.data.DataLoader,
-    max_examples: int,
-    device: torch.device,
+def make_output_transform(target_mean: torch.Tensor, target_std: torch.Tensor):
+    target_mean = target_mean.detach()
+    target_std = target_std.detach()
+
+    def transform(output):
+        primary = output[0] if isinstance(output, (tuple, list)) else output
+        if not isinstance(primary, Distribution):
+            raise TypeError("Insertion/Deletion output transform expects a Distribution.")
+        pred_mean = primary.mean
+        pred_std = primary.stddev
+        return kl_divergence_gaussian(
+            pred_mean=pred_mean,
+            pred_std=pred_std,
+            target_mean=target_mean.to(pred_mean.device),
+            target_std=target_std.to(pred_mean.device),
+        )
+
+    return transform
+
+
+def generate_random_attr(
+    obs: torch.Tensor,
+    strategy: str = "normal",
+    normalize: bool = False,
 ) -> torch.Tensor:
-    collected = []
-    total = 0
-    for batch in loader:
-        chunk = batch[0]
-        collected.append(chunk)
-        total += chunk.size(0)
-        if total >= max_examples:
-            break
-    if not collected:
-        raise RuntimeError("Unable to collect background samples from the dataset.")
-    background = torch.cat(collected, dim=0)[:max_examples]
-    return background.to(device)
+    if strategy == "normal":
+        attr = torch.randn_like(obs)
+    elif strategy == "uniform":
+        attr = torch.rand_like(obs)
+    else:
+        raise ValueError("attr_strategy must be 'normal' or 'uniform'")
+    attr = attr.abs()
+    if normalize:
+        flat = attr.view(attr.size(0), -1)
+        denom = flat.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        flat = flat / denom
+        attr = flat.view_as(attr)
+    return attr
 
 
-def evaluate(cfg: SHAPConfig):
+def evaluate(cfg: RandomConfig):
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader, val_loader, input_dim, action_dim = get_dataloaders_vector(
         cfg.data_path, cfg.batch_size, cfg.num_workers, seed=cfg.seed
     )
+    if val_loader is None:
+        raise RuntimeError("Validation loader is None; random baseline needs a split.")
     if action_dim is None:
         raise ValueError("Dataset must contain action labels to compute metrics.")
+
     actor = load_actor_state(
         input_dim=input_dim,
         action_dim=action_dim,
@@ -190,12 +134,8 @@ def evaluate(cfg: SHAPConfig):
         device=device,
     )
 
-    background = collect_background(train_loader, cfg.background_size, device)
-    explainer = shap.DeepExplainer(ActorMeanHead(actor), background)
-
     insertion = Insertion(enable_plots=cfg.plot_metrics)
     deletion = Deletion(enable_plots=cfg.plot_metrics)
-
     output_root = Path(cfg.out_dir)
     curves_dir = output_root / "curves"
     os.makedirs(curves_dir, exist_ok=True)
@@ -208,21 +148,8 @@ def evaluate(cfg: SHAPConfig):
     }
     total_examples = 0
 
-    if val_loader is None:
-        raise RuntimeError("Validation loader is None; SHAP baseline needs a split.")
-
-    total_batches = len(val_loader)
-    if cfg.eval_batches is not None:
-        total_batches = min(total_batches, cfg.eval_batches)
-    progress = tqdm(
-        val_loader,
-        total=total_batches,
-        desc="Evaluating SHAP baseline",
-        leave=False,
-    )
-
-    for batch_idx, batch in enumerate(progress):
-        if batch_idx >= total_batches:
+    for batch_idx, batch in enumerate(val_loader):
+        if cfg.eval_batches is not None and batch_idx >= cfg.eval_batches:
             break
 
         obs = batch[0].to(device, non_blocking=True)
@@ -230,8 +157,11 @@ def evaluate(cfg: SHAPConfig):
         target_std = batch[2].to(device, non_blocking=True)
         batch_ids = batch[3] if len(batch) > 3 else None
 
-        shap_values = explainer.shap_values(obs)
-        attr = aggregate_shap_values(shap_values, obs)
+        attr = generate_random_attr(
+            obs,
+            strategy=cfg.attr_strategy,
+            normalize=cfg.normalize_attr,
+        )
 
         dist = actor(obs * torch.sigmoid(attr))
         pred_mean = dist.mean
@@ -246,12 +176,12 @@ def evaluate(cfg: SHAPConfig):
         kl_mean = per_sample_kl.mean()
         mse_mean = F.mse_loss(pred_mean, target_mean)
         mse_std = F.mse_loss(pred_std, target_std)
+        bs = obs.size(0)
 
-        batch_size = obs.size(0)
-        aggregated["nll"] += kl_mean.item() * batch_size
+        aggregated["nll"] += kl_mean.item() * bs
         aggregated["kl"] += per_sample_kl.sum().item()
-        aggregated["mse_mean"] += mse_mean.item() * batch_size
-        aggregated["mse_std"] += mse_std.item() * batch_size
+        aggregated["mse_mean"] += mse_mean.item() * bs
+        aggregated["mse_std"] += mse_std.item() * bs
 
         output_transform = make_output_transform(target_mean, target_std)
         insertion.output_transform = output_transform
@@ -272,17 +202,10 @@ def evaluate(cfg: SHAPConfig):
             sample_ids=batch_ids,
         )
 
-        total_examples += batch_size
+        total_examples += bs
 
-        progress.set_postfix(
-            batches=f"{batch_idx+1}/{total_batches}",
-            insertion=f"{(sum(insertion_auc)/batch_size):.4f}",
-            deletion=f"{(sum(deletion_auc)/batch_size):.4f}",
-        )
-
-    progress.close()
-    normalized_insertion = insertion.flush(str(curves_dir), prefix="shap_insertion")
-    normalized_deletion = deletion.flush(str(curves_dir), prefix="shap_deletion")
+    normalized_insertion = insertion.flush(str(curves_dir), prefix="random_insertion")
+    normalized_deletion = deletion.flush(str(curves_dir), prefix="random_deletion")
 
     if total_examples == 0:
         raise RuntimeError("Validation loader produced zero examples.")
@@ -297,20 +220,20 @@ def evaluate(cfg: SHAPConfig):
 
     summary["insertion_auc"] = mean_auc(normalized_insertion)
     summary["deletion_auc"] = mean_auc(normalized_deletion)
-    summary_path = output_root / "shap_metrics.json"
     os.makedirs(output_root, exist_ok=True)
+    summary_path = output_root / "random_metrics.json"
     with open(summary_path, "w", encoding="utf-8") as fp:
         json.dump({"config": asdict(cfg), "metrics": summary}, fp, indent=2)
 
-    print("SHAP baseline metrics:")
+    print("Random baseline metrics:")
     for key, value in summary.items():
         print(f"  {key}: {value:.6f}")
     print(f"Saved detailed curves and metrics under: {output_root.resolve()}")
 
 
-def parse_args() -> SHAPConfig:
+def parse_args() -> RandomConfig:
     parser = argparse.ArgumentParser(
-        description="SHAP baseline for the PointGoal1 actor (Insertion/Deletion)."
+        description="Random attribution baseline for PointGoal1 insertion/deletion."
     )
     parser.add_argument("--data-path", type=str, default="./data/vectors.npy")
     parser.add_argument(
@@ -329,12 +252,6 @@ def parse_args() -> SHAPConfig:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument(
-        "--background-size",
-        type=int,
-        default=512,
-        help="Number of samples used as SHAP background.",
-    )
-    parser.add_argument(
         "--eval-batches",
         type=int,
         default=None,
@@ -348,9 +265,21 @@ def parse_args() -> SHAPConfig:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--attr-strategy",
+        type=str,
+        choices=["normal", "uniform"],
+        default="normal",
+        help="Distribution for random attributions.",
+    )
+    parser.add_argument(
+        "--normalize-attr",
+        action="store_true",
+        help="Normalize attributions per-sample to sum to 1.",
+    )
+    parser.add_argument(
         "--out-dir",
         type=str,
-        default="./shap_outputs",
+        default="./random_outputs",
         help="Directory where curves and metrics will be stored.",
     )
     parser.add_argument(
@@ -360,16 +289,17 @@ def parse_args() -> SHAPConfig:
     )
 
     args = parser.parse_args()
-    return SHAPConfig(
+    return RandomConfig(
         data_path=args.data_path,
         actor_ckpt=args.actor_ckpt,
         actor_hidden=tuple(args.actor_hidden),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        background_size=args.background_size,
         eval_batches=args.eval_batches,
         insertion_fraction=args.insertion_fraction,
         seed=args.seed,
+        attr_strategy=args.attr_strategy,
+        normalize_attr=args.normalize_attr,
         out_dir=args.out_dir,
         plot_metrics=not args.no_plot_metrics,
     )
