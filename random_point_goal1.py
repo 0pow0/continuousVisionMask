@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.distributions import Distribution
 
 from actor import Actor
-from metrics import Insertion, Deletion
+from metrics import Deletion, Insertion, QuantusAttributionMetrics
 from point_goal1 import get_dataloaders_vector, kl_divergence_gaussian, set_seed
 
 
@@ -136,6 +136,27 @@ def evaluate(cfg: RandomConfig):
 
     insertion = Insertion(enable_plots=cfg.plot_metrics)
     deletion = Deletion(enable_plots=cfg.plot_metrics)
+    quantus_metrics = None
+    actor_param = next(actor.parameters(), None)
+    attr_dtype = actor_param.dtype if actor_param is not None else torch.float32
+    try:
+        quantus_metrics = QuantusAttributionMetrics(
+            sparseness_kwargs={"disable_warnings": True, "display_progressbar": False},
+            lipschitz_kwargs={"disable_warnings": True, "display_progressbar": False},
+            device="gpu" if device.type == "cuda" else "cpu",
+        )
+    except ImportError:
+        print("Quantus not available; skipping Quantus metrics.")
+        quantus_metrics = None
+
+    def quantus_explain_fn(_, inputs, targets, **kwargs):
+        inputs_tensor = torch.as_tensor(inputs, device=device, dtype=attr_dtype)
+        attr_random = generate_random_attr(
+            inputs_tensor,
+            strategy=cfg.attr_strategy,
+            normalize=cfg.normalize_attr,
+        )
+        return attr_random.detach().cpu().numpy()
     output_root = Path(cfg.out_dir)
     curves_dir = output_root / "curves"
     os.makedirs(curves_dir, exist_ok=True)
@@ -147,6 +168,7 @@ def evaluate(cfg: RandomConfig):
         "kl": 0.0,
     }
     total_examples = 0
+    quantus_summary: dict[str, float] = {}
 
     for batch_idx, batch in enumerate(val_loader):
         if cfg.eval_batches is not None and batch_idx >= cfg.eval_batches:
@@ -201,11 +223,22 @@ def evaluate(cfg: RandomConfig):
             fraction=cfg.insertion_fraction,
             sample_ids=batch_ids,
         )
+        if quantus_metrics is not None:
+            quantus_metrics(
+                model=actor,
+                x=obs,
+                attr=attr,
+                sample_ids=batch_ids,
+                explain_func=quantus_explain_fn,
+            )
 
         total_examples += bs
 
     normalized_insertion = insertion.flush(str(curves_dir), prefix="random_insertion")
     normalized_deletion = deletion.flush(str(curves_dir), prefix="random_deletion")
+    if quantus_metrics is not None:
+        quantus_summary = quantus_metrics.summary()
+        quantus_metrics.flush(curves_dir / "random_quantus.pt")
 
     if total_examples == 0:
         raise RuntimeError("Validation loader produced zero examples.")
@@ -220,6 +253,9 @@ def evaluate(cfg: RandomConfig):
 
     summary["insertion_auc"] = mean_auc(normalized_insertion)
     summary["deletion_auc"] = mean_auc(normalized_deletion)
+    if quantus_summary:
+        summary["quantus_sparseness"] = quantus_summary.get("sparseness_mean", 0.0)
+        summary["quantus_lipschitz"] = quantus_summary.get("local_lipschitz_mean", 0.0)
     os.makedirs(output_root, exist_ok=True)
     summary_path = output_root / "random_metrics.json"
     with open(summary_path, "w", encoding="utf-8") as fp:

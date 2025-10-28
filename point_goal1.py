@@ -51,7 +51,7 @@ from torchvision import datasets, transforms, utils as vutils
 from tqdm.auto import tqdm
 
 from actor import Actor
-from metrics import Insertion, Deletion
+from metrics import Deletion, Insertion, QuantusAttributionMetrics
 
 
 # ---------------------------
@@ -662,6 +662,34 @@ def train(cfg: Config):
     insertion = Insertion(enable_plots=cfg.plot_metrics)
     deletion = Deletion(enable_plots=cfg.plot_metrics)
 
+    quantus_metrics = None
+    model_param = next(model.parameters(), None)
+    model_dtype = model_param.dtype if model_param is not None else torch.float32
+    try:
+        quantus_metrics = QuantusAttributionMetrics(
+            sparseness_kwargs={"disable_warnings": True, "display_progressbar": False},
+            lipschitz_kwargs={
+                "disable_warnings": True,
+                "display_progressbar": False,
+            },
+            device="gpu" if device.type == "cuda" else "cpu",
+        )
+    except ImportError:
+        print("Quantus not available; skipping Quantus metrics.")
+        quantus_metrics = None
+
+    def quantus_explain_fn(_, inputs, targets, **kwargs):
+        inputs_tensor = torch.as_tensor(inputs, device=device, dtype=model_dtype)
+        with torch.no_grad():
+            dist_local, _, z_q_local = model(inputs_tensor)
+        attr_local = torch.nan_to_num(
+            z_q_local / inputs_tensor,
+            nan=0.0,
+            posinf=-1e6,
+            neginf=-1e6,
+        )
+        return attr_local.detach().cpu().numpy()
+
     skip_training = cfg.resume is not None
     last_epoch_idx = start_epoch - 1
 
@@ -768,6 +796,7 @@ def train(cfg: Config):
                     desc="Validation",
                     leave=False,
                 )
+                quantus_summary: dict[str, float] = {}
                 for v_idx, v_batch in enumerate(val_progress):
                     vecs_v = v_batch[0].to(device, non_blocking=True)
                     mean_v = v_batch[1].to(device, non_blocking=True)
@@ -815,6 +844,14 @@ def train(cfg: Config):
                         fraction=1.0,
                         sample_ids=ids_v,
                     )
+                    if quantus_metrics is not None:
+                        quantus_metrics(
+                            model=model,
+                            x=vecs_v,
+                            attr=attr_v,
+                            sample_ids=ids_v,
+                            explain_func=quantus_explain_fn,
+                        )
                     avg_nll_val = total_nll / max(1, total_examples)
                     val_progress.set_postfix(
                         nll=f"{avg_nll_val:.6f}",
@@ -829,6 +866,12 @@ def train(cfg: Config):
                     output_dir=str(curves_output_dir),
                     prefix=f"val_deletion_epoch_{eval_epoch_num:03d}",
                 )
+                if quantus_metrics is not None:
+                    quantus_summary = quantus_metrics.summary()
+                    quantus_metrics.flush(
+                        output_path=curves_output_dir
+                        / f"val_quantus_epoch_{eval_epoch_num:03d}.pt"
+                    )
 
                 def mean_auc(records):
                     if not records:
@@ -848,6 +891,13 @@ def train(cfg: Config):
                         val_metrics["val/kl"] = total_kl / total_examples
                         val_metrics["val/insertion_auc"] = mean_auc(normalized_insertion)
                         val_metrics["val/deletion_auc"] = mean_auc(normalized_deletion)
+                        if quantus_summary:
+                            val_metrics["val/quantus_sparseness"] = quantus_summary.get(
+                                "sparseness_mean", 0.0
+                            )
+                            val_metrics["val/quantus_lipschitz"] = quantus_summary.get(
+                                "local_lipschitz_mean", 0.0
+                            )
                     if wandb_run is not None:
                         wandb_run.log(val_metrics, step=global_step)
 
