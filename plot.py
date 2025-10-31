@@ -47,6 +47,17 @@ BUTTON_FEATURE_GROUPS: tuple[tuple[str, int], ...] = (
     ("hazard", 16),
 )
 
+PUSH_FEATURE_GROUPS: tuple[tuple[str, int], ...] = (
+    ("acc", 3),
+    ("vel", 3),
+    ("gyro", 3),
+    ("mag", 3),
+    ("goal", 16),
+    ("hazard", 16),
+    ("pillars", 16),
+    ("push_box", 16),
+)
+
 
 def infer_feature_groups(*sources: Path | str) -> tuple[tuple[str, int], ...]:
     """
@@ -58,6 +69,8 @@ def infer_feature_groups(*sources: Path | str) -> tuple[tuple[str, int], ...]:
     tokens = " ".join(str(src) for src in sources).lower()
     if "button1" in tokens:
         return BUTTON_FEATURE_GROUPS
+    elif "push1" in tokens:
+        return PUSH_FEATURE_GROUPS
     return FEATURE_GROUPS
 
 
@@ -68,6 +81,8 @@ def _groups_from_record(record: dict[str, Any] | None, base: tuple[tuple[str, in
         value = record.get(key)
         if isinstance(value, str) and "button1" in value.lower():
             return BUTTON_FEATURE_GROUPS
+        elif isinstance(value, str) and "push1" in value.lower():
+            return PUSH_FEATURE_GROUPS
     return base
 
 
@@ -166,6 +181,220 @@ def _extract_feature_vector(attr) -> np.ndarray:
     if arr.ndim == 0:
         raise ValueError("Attribution array must have at least one dimension.")
     return arr.reshape(-1)
+
+
+def _iter_sample_ids(sample_ids) -> list[Any]:
+    """
+    Flatten ``sample_ids`` into a Python list of scalar identifiers.
+    Handles tensors, numpy arrays, and nested sequences.
+    """
+    if torch is not None and torch.is_tensor(sample_ids):
+        data = sample_ids.detach().cpu()
+        if data.ndim == 0:
+            return [data.item()]
+        return data.reshape(-1).tolist()
+    if isinstance(sample_ids, np.ndarray):
+        if sample_ids.ndim == 0:
+            return [sample_ids.item()]
+        return sample_ids.reshape(-1).tolist()
+    if isinstance(sample_ids, (list, tuple)):
+        flattened: list[Any] = []
+        for item in sample_ids:
+            flattened.extend(_iter_sample_ids(item))
+        return flattened
+    return [sample_ids]
+
+
+def _iter_observations(observations) -> list[np.ndarray]:
+    """
+    Flatten ``observations`` into a list of 1D numpy arrays.
+    Any higher dimensional tensors/arrays are split along the first axis.
+    """
+    if torch is not None and torch.is_tensor(observations):
+        data = observations.detach().cpu().numpy()
+        if data.ndim == 0:
+            raise ValueError("Observation tensor must have at least one dimension.")
+        if data.ndim == 1:
+            return [np.array(data, dtype=float).reshape(-1)]
+        return [np.array(chunk, dtype=float).reshape(-1) for chunk in data]
+
+    if isinstance(observations, np.ndarray):
+        if observations.ndim == 0:
+            raise ValueError("Observation tensor must have at least one dimension.")
+        if observations.ndim == 1:
+            return [np.array(observations, dtype=float).reshape(-1)]
+        if observations.dtype == object:
+            vectors: list[np.ndarray] = []
+            for item in observations.tolist():
+                vectors.extend(_iter_observations(item))
+            return vectors
+        return [np.array(chunk, dtype=float).reshape(-1) for chunk in observations]
+
+    if isinstance(observations, (list, tuple)):
+        vectors: list[np.ndarray] = []
+        for item in observations:
+            vectors.extend(_iter_observations(item))
+        return vectors
+
+    data = _to_numpy_array(observations)
+    if data.ndim == 0:
+        raise ValueError("Observation tensor must have at least one dimension.")
+    return [data.reshape(-1)]
+
+
+def _register_state_entry(mapping: dict[Any, np.ndarray], sample_id: Any, obs_vector: np.ndarray) -> None:
+    """
+    Store ``obs_vector`` under multiple keys derived from ``sample_id`` for robust lookup.
+    """
+    if torch is not None and torch.is_tensor(sample_id):
+        if sample_id.ndim == 0:
+            sample_id = sample_id.item()
+        else:
+            sample_id = sample_id.detach().cpu().tolist()
+    if isinstance(sample_id, np.ndarray):
+        if sample_id.ndim == 0:
+            sample_id = sample_id.item()
+        else:
+            sample_id = sample_id.reshape(-1).tolist()
+    if isinstance(sample_id, (list, tuple)):
+        for entry in sample_id:
+            _register_state_entry(mapping, entry, obs_vector)
+        return
+
+    keys: set[Any] = set()
+    keys.add(sample_id)
+    try:
+        string_key = str(sample_id)
+    except Exception:
+        string_key = None
+    else:
+        keys.add(string_key)
+
+    if isinstance(sample_id, str):
+        try:
+            numeric = int(sample_id)
+        except ValueError:
+            numeric = None
+        if numeric is not None:
+            keys.add(numeric)
+            keys.add(str(numeric))
+    elif isinstance(sample_id, (int, np.integer)):
+        numeric = int(sample_id)
+        keys.add(numeric)
+        keys.add(str(numeric))
+
+    for key in keys:
+        mapping[key] = obs_vector
+
+
+def _load_state_vectors(state_path: Path | None) -> dict[Any, np.ndarray]:
+    """
+    Load per-sample state vectors from ``state_path``.
+
+    The checkpoint is expected to either be:
+
+    * A list of dicts each containing ``sample_id`` and ``obs`` keys.
+    * A dict with ``sample_id`` and ``obs`` entries (arrays/lists/tensors).
+    * A dict keyed by sample id where each value contains an ``obs`` array.
+    """
+    if state_path is None:
+        return {}
+    if torch is None:
+        raise ImportError("torch is required to load state files saved with torch.save().")
+
+    payload = torch.load(state_path, map_location="cpu")
+    state_map: dict[Any, np.ndarray] = {}
+
+    def add_pair(sample_id: Any, obs_value: Any) -> None:
+        vector = _to_numpy_array(obs_value).reshape(-1)
+        _register_state_entry(state_map, sample_id, vector)
+
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict) and "obs" in item:
+                sample_id = item.get("sample_id")
+                if sample_id is None:
+                    continue
+                add_pair(sample_id, item["obs"])
+        return state_map
+
+    if isinstance(payload, dict):
+        if "sample_id" in payload and "obs" in payload:
+            sample_ids = _iter_sample_ids(payload["sample_id"])
+            observations = _iter_observations(payload["obs"])
+            if len(sample_ids) != len(observations):
+                raise ValueError(
+                    f"State file {state_path} contains {len(sample_ids)} sample_id entries "
+                    f"but {len(observations)} observation rows."
+                )
+            for sid, obs_vector in zip(sample_ids, observations):
+                add_pair(sid, obs_vector)
+            return state_map
+        for key, value in payload.items():
+            if isinstance(value, dict) and "obs" in value:
+                add_pair(value.get("sample_id", key), value["obs"])
+            elif not isinstance(value, dict):
+                add_pair(key, value)
+        return state_map
+
+    raise TypeError(f"Unsupported state file format: {type(payload)!r}")
+
+
+def _lookup_state_vector(state_map: dict[Any, np.ndarray], sample_id: Any) -> np.ndarray | None:
+    """
+    Resolve ``sample_id`` to its corresponding state vector if available.
+    """
+    if not state_map:
+        return None
+    candidates = []
+    if torch is not None and torch.is_tensor(sample_id):
+        if sample_id.ndim == 0:
+            sample_id = sample_id.item()
+        else:
+            for entry in sample_id.reshape(-1).tolist():
+                result = _lookup_state_vector(state_map, entry)
+                if result is not None:
+                    return result
+            return None
+    if isinstance(sample_id, np.ndarray):
+        if sample_id.ndim == 0:
+            sample_id = sample_id.item()
+        else:
+            for entry in sample_id.reshape(-1).tolist():
+                result = _lookup_state_vector(state_map, entry)
+                if result is not None:
+                    return result
+            return None
+    if isinstance(sample_id, (list, tuple)):
+        for entry in sample_id:
+            result = _lookup_state_vector(state_map, entry)
+            if result is not None:
+                return result
+        return None
+
+    candidates.append(sample_id)
+    try:
+        sample_str = str(sample_id)
+    except Exception:
+        sample_str = None
+    else:
+        candidates.append(sample_str)
+
+    if isinstance(sample_id, str):
+        try:
+            sample_int = int(sample_id)
+        except ValueError:
+            sample_int = None
+        if sample_int is not None:
+            candidates.extend([sample_int, str(sample_int)])
+    elif isinstance(sample_id, (int, np.integer)):
+        sample_int = int(sample_id)
+        candidates.extend([sample_int, str(sample_int)])
+
+    for candidate in candidates:
+        if candidate in state_map:
+            return state_map[candidate]
+    return None
 
 
 def _prepare_heatmap(attr, background: np.ndarray | None) -> tuple[np.ndarray, bool]:
@@ -272,6 +501,7 @@ def render_results_file(
     heat_alpha: float = 0.6,
     overlay_heatmap: bool | None = None,
     limit: int | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, list]:
     if torch is None:
         raise ImportError("torch is required to load attribution files saved with torch.save().")
@@ -281,11 +511,13 @@ def render_results_file(
 
     feature_groups = infer_feature_groups(results_path, image_root)
     name_index, numeric_index = _index_frame_images(image_root)
+    state_map = _load_state_vectors(state_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     processed = 0
     missing_images: list = []
     skipped: list = []
+    missing_states: list = []
 
     ordered_items = sorted(results.items(), key=lambda item: str(item[0]))
     for sample_id, record in ordered_items:
@@ -313,7 +545,7 @@ def render_results_file(
         use_overlay = inferred_overlay if overlay_heatmap is None else overlay_heatmap
 
         groups = _groups_from_record(record if isinstance(record, dict) else None, feature_groups)
-        feature_scores, feature_labels, _, _ = select_top_features(
+        feature_scores, feature_labels, feature_indices, _ = select_top_features(
             feature_vec,
             top_k=top_k,
             skip_top=skip_top,
@@ -324,10 +556,27 @@ def render_results_file(
         save_path = output_dir / f"frame_{safe_id}.png"
         print(f"[sample {sample_id}] -> {save_path.name}")
 
+        feature_values = None
+        max_index = int(feature_indices.max()) if feature_indices.size else -1
+        if state_map:
+            state_vector = _lookup_state_vector(state_map, sample_id)
+            if state_vector is None:
+                missing_states.append((sample_id, "state missing"))
+            elif max_index >= state_vector.size:
+                missing_states.append(
+                    (
+                        sample_id,
+                        f"state length {state_vector.size} insufficient for feature index {max_index}",
+                    )
+                )
+            else:
+                feature_values = state_vector[feature_indices]
+
         plot_heat_with_strips(
             heatmap,
             feature_scores=feature_scores,
             feature_labels=feature_labels,
+            feature_values=feature_values,
             show=False,
             save_path=str(save_path),
             background=background,
@@ -343,6 +592,7 @@ def render_results_file(
         "processed": processed,
         "missing_images": missing_images,
         "skipped": skipped,
+        "missing_states": missing_states,
     }
 
 
@@ -359,12 +609,14 @@ def render_single_sample(
     show_colorbar: bool = True,
     show: bool = True,
     output_path: Path | str | None = None,
+    state_path: Path | None = None,
 ) -> plt.Figure:
     """
     Render a single attribution figure for ``sample_id`` from ``results_path``.
 
     Parameters mirror :func:`render_results_file` so the figure matches the batch
-    renderer's appearance.
+    renderer's appearance. When ``state_path`` is provided the top-k feature
+    state values are shown beneath their labels.
     """
     if torch is None:
         raise ImportError("torch is required to load attribution files saved with torch.save().")
@@ -408,12 +660,26 @@ def render_single_sample(
 
     feature_groups = infer_feature_groups(results_path, image_root)
     groups = _groups_from_record(record if isinstance(record, dict) else None, feature_groups)
-    feature_scores, feature_labels, _, _ = select_top_features(
+    feature_scores, feature_labels, feature_indices, _ = select_top_features(
         feature_vec,
         top_k=top_k,
         skip_top=skip_top,
         groups=groups,
     )
+
+    feature_values = None
+    if state_path is not None:
+        state_map = _load_state_vectors(state_path)
+        state_vector = _lookup_state_vector(state_map, resolved_key)
+        if state_vector is None:
+            raise KeyError(f"State vector for sample {resolved_key!r} not found in {state_path}.")
+        max_index = int(feature_indices.max()) if feature_indices.size else -1
+        if max_index >= state_vector.size:
+            raise ValueError(
+                f"State vector for sample {resolved_key!r} has length {state_vector.size}, "
+                f"but feature index {max_index} is required."
+            )
+        feature_values = state_vector[feature_indices]
 
     save_path_str = None
     if output_path is not None:
@@ -429,6 +695,7 @@ def render_single_sample(
         feature_scores=feature_scores,
         feature_labels=feature_labels,
         show=show,
+        feature_values=feature_values,
         save_path=save_path_str,
         background=background,
         cmap=cmap,
@@ -444,6 +711,7 @@ def plot_heat_with_strips(
     feature_scores: Sequence[float] | np.ndarray,
     feature_labels: Sequence[str],
     *,
+    feature_values: Sequence[float] | np.ndarray | None = None,
     cmap: str = "jet",
     show: bool = True,
     save_path: str | None = None,
@@ -463,6 +731,9 @@ def plot_heat_with_strips(
         1D sequence of normalized importances (0-1) for the features to highlight on top.
     feature_labels:
         Sequence of strings labelling each feature. Must match ``feature_scores`` length.
+    feature_values:
+        Optional raw feature values aligned with ``feature_labels``. When provided,
+        the values are displayed between the label row and the heat strip.
     cmap:
         Matplotlib colormap name. Defaults to ``'jet'`` which mirrors ``cv2.COLORMAP_JET``.
     show:
@@ -505,11 +776,34 @@ def plot_heat_with_strips(
     if feature_scores_arr.size == 0:
         raise ValueError("At least one feature score is required.")
 
+    values_arr = None
+    if feature_values is not None:
+        values_arr = np.asarray(feature_values, dtype=float).reshape(-1)
+        if values_arr.size != feature_scores_arr.size:
+            raise ValueError("feature_values length must match feature_scores length.")
+
     num_features = feature_scores_arr.size
     scale = min(0.8, max(0.45, 4.5 / max(1, num_features)))
     label_height = 1.0 * scale
     strip_height = 0.9 * scale
-    fontsize = max(6, int(round(11 * scale)))
+    fontsize = 9.5
+    if values_arr is not None:
+        value_height = 0.75 * scale
+        height_ratios = [label_height, value_height, strip_height, 0.2, 12]
+        nrows = 5
+        row_labels = 0
+        row_values = 1
+        row_strip = 2
+        row_spacer = 3
+        row_main = 4
+    else:
+        height_ratios = [label_height, strip_height, 0.2, 12]
+        nrows = 4
+        row_labels = 0
+        row_values = None
+        row_strip = 1
+        row_spacer = 2
+        row_main = 3
 
     fig = plt.figure(figsize=(6, 6), constrained_layout=False)
     if show_colorbar:
@@ -519,16 +813,16 @@ def plot_heat_with_strips(
         grid_ncols = 1
         width_ratios = [20]
     gs = fig.add_gridspec(
-        nrows=4,
+        nrows=nrows,
         ncols=grid_ncols,
-        height_ratios=[label_height, strip_height, 0.2, 12],
+        height_ratios=height_ratios,
         width_ratios=width_ratios,
         hspace=0.05,
         wspace=0.15,
     )
 
     # Feature label axis.
-    ax_labels = fig.add_subplot(gs[0, 0])
+    ax_labels = fig.add_subplot(gs[row_labels, 0])
     ax_labels.set_axis_off()
     ax_labels.set_xlim(0, feature_scores_arr.size)
     ax_labels.set_ylim(0, 1)
@@ -543,8 +837,28 @@ def plot_heat_with_strips(
             fontweight="bold",
         )
 
+    if values_arr is not None and row_values is not None:
+        ax_values = fig.add_subplot(gs[row_values, 0])
+        ax_values.set_axis_off()
+        ax_values.set_xlim(0, feature_scores_arr.size)
+        ax_values.set_ylim(0, 1)
+        for idx, value in enumerate(values_arr):
+            formatted = f"{value:.3f}".rstrip("0").rstrip(".")
+            if not formatted or formatted == "-":
+                formatted = "0"
+            if formatted == "-0":
+                formatted = "0"
+            ax_values.text(
+                idx + 0.5,
+                0.5,
+                formatted,
+                ha="center",
+                va="center",
+                fontsize=fontsize,
+            )
+
     # Heat strip axis.
-    ax_strip = fig.add_subplot(gs[1, 0])
+    ax_strip = fig.add_subplot(gs[row_strip, 0])
     ax_strip.imshow(
         feature_scores_arr[None, :],
         cmap=cmap,
@@ -556,11 +870,11 @@ def plot_heat_with_strips(
     ax_strip.set_yticks([])
 
     # Spacer axis to keep separation.
-    ax_spacer = fig.add_subplot(gs[2, 0])
+    ax_spacer = fig.add_subplot(gs[row_spacer, 0])
     ax_spacer.set_axis_off()
 
     # Main heatmap axis.
-    ax_main = fig.add_subplot(gs[3, 0])
+    ax_main = fig.add_subplot(gs[row_main, 0])
     if bg is not None:
         ax_main.imshow(bg, aspect="auto")
 
@@ -649,6 +963,11 @@ if __name__ == "__main__":
         help="Directory containing frame subfolders with frame_id*.png files.",
     )
     parser.add_argument(
+        "--state",
+        type=Path,
+        help="Optional path to a .pt file containing state vectors with 'sample_id' and 'obs' entries.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         help="Directory where rendered figures will be written.",
@@ -725,6 +1044,7 @@ if __name__ == "__main__":
             results_path=cli_args.results,
             image_root=cli_args.image_root,
             sample_id=cli_args.sample_id,
+            state_path=cli_args.state,
             top_k=cli_args.top_k,
             skip_top=cli_args.skip_top,
             cmap=cli_args.cmap,
@@ -743,6 +1063,7 @@ if __name__ == "__main__":
             results_path=cli_args.results,
             image_root=cli_args.image_root,
             output_dir=cli_args.output_dir,
+            state_path=cli_args.state,
             top_k=cli_args.top_k,
             skip_top=cli_args.skip_top,
             cmap=cli_args.cmap,
@@ -755,3 +1076,7 @@ if __name__ == "__main__":
             print(f"Missing images for {len(summary['missing_images'])} sample(s): {summary['missing_images']}")
         if summary["skipped"]:
             print(f"Skipped {len(summary['skipped'])} sample(s): {summary['skipped']}")
+        if summary["missing_states"]:
+            print(
+                f"Missing states for {len(summary['missing_states'])} sample(s): {summary['missing_states']}"
+            )
